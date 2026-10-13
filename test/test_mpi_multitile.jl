@@ -1,0 +1,254 @@
+#!/usr/bin/env julia
+# Run with: mpiexecjl -np N julia --project=. test/test_mpi_multitile.jl
+# Checks run_multitile_mpi against serial run_multitile.
+# Distributed FFT is Float64, serial is Float32, so comparisons are approximate.
+
+using MPI
+MPI.Init()
+
+using Huntian
+using PencilFFTs
+using PencilArrays
+using Test
+
+comm = MPI.COMM_WORLD
+rank = MPI.Comm_rank(comm)
+nranks = MPI.Comm_size(comm)
+
+
+function _make_pk_file(dir)
+    path = joinpath(dir, "test_pk.dat")
+    ks = 10.0 .^ range(-4, stop=1, length=200)
+    open(path, "w") do f
+        for k in ks
+            Pk = 1e4 * k^(-1.5)
+            println(f, "$k  $Pk")
+        end
+    end
+    return path
+end
+
+function _make_filter_file(dir)
+    path = joinpath(dir, "test_filter.dat")
+    open(path, "w") do f
+        println(f, "3")
+        println(f, "1  1.686  8.0")
+        println(f, "2  1.686  5.0")
+        println(f, "3  1.686  3.0")
+    end
+    return path
+end
+
+function _make_config(dir; n=64, boxsize=200.0, z=0.0, ilpt=1, nbuff=4,
+                      ioutshear=0, rmax2rs=0.0)
+    pkfile = _make_pk_file(dir)
+    filterfile = _make_filter_file(dir)
+    outfile = joinpath(dir, "test_out.pksc")
+    tabfile = joinpath(@__DIR__, "data", "HomelTab_julia.dat")
+
+    PipelineConfig(
+        Omx       = 0.315 - 0.049,
+        OmB       = 0.049,
+        Omvac     = 0.685,
+        h         = 0.674,
+        n         = n,
+        boxsize   = boxsize,
+        nbuff     = nbuff,
+        z_out     = z,
+        z_max     = z,
+        ilpt      = ilpt,
+        ioutshear = ioutshear,
+        rmax2rs   = rmax2rs,
+        pkfile    = pkfile,
+        filterfile = filterfile,
+        fileout   = outfile,
+        tabfile   = tabfile,
+    )
+end
+
+if nranks == 1
+    @testset "MPI np=1, ntile=1 ≈ serial" begin
+        tmpdir = mktempdir()
+
+        cfg_serial = _make_config(tmpdir; n=32, boxsize=100.0, z=0.0, ilpt=1, nbuff=3)
+        halos_serial = Huntian.MultiTile.run_multitile(cfg_serial; ntile=1, seed=42,
+                                                          verbose=false)
+
+        cfg_mpi = PipelineConfig(
+            Omx = cfg_serial.Omx, OmB = cfg_serial.OmB,
+            Omvac = cfg_serial.Omvac, h = cfg_serial.h,
+            n = cfg_serial.n, boxsize = cfg_serial.boxsize, nbuff = cfg_serial.nbuff,
+            z_out = cfg_serial.z_out, z_max = cfg_serial.z_max, ilpt = cfg_serial.ilpt,
+            rmax2rs = cfg_serial.rmax2rs, pkfile = cfg_serial.pkfile,
+            filterfile = cfg_serial.filterfile,
+            fileout = joinpath(tmpdir, "test_out_mpi.pksc"),
+            tabfile = cfg_serial.tabfile,
+        )
+
+        halos_mpi = Huntian.run_multitile_mpi(cfg_mpi; ntile=1, seed=42,
+                                                  verbose=false, comm=comm)
+
+        @test length(halos_serial) == length(halos_mpi)
+
+        if !isempty(halos_serial) && !isempty(halos_mpi)
+            sort!(halos_serial; by=h -> (h.x, h.y, h.z))
+            sort!(halos_mpi; by=h -> (h.x, h.y, h.z))
+
+            # Approximate match: Float64 distributed FFT vs Float32 serial FFT
+            for i in 1:length(halos_serial)
+                @test halos_serial[i].x ≈ halos_mpi[i].x atol=0.5
+                @test halos_serial[i].y ≈ halos_mpi[i].y atol=0.5
+                @test halos_serial[i].z ≈ halos_mpi[i].z atol=0.5
+                @test halos_serial[i].RTHL ≈ halos_mpi[i].RTHL rtol=0.1
+            end
+        end
+
+        rm(tmpdir; recursive=true)
+    end
+
+    # z>0 with 2LPT: at z=0/1LPT the D vs D/a growth factor (equal at a=1), the 2LPT
+    # -3/7 sign and the 2LPT trace-identity Nyquist handling are all invisible.
+    @testset "MPI np=1 displacements ≈ serial (z=1, 2LPT)" begin
+        tmpdir = mktempdir()
+        cfg_serial = _make_config(tmpdir; n=32, boxsize=100.0, z=1.0, ilpt=2, nbuff=3)
+        halos_serial = Huntian.MultiTile.run_multitile(cfg_serial; ntile=1, seed=42, verbose=false)
+        cfg_mpi = PipelineConfig(
+            Omx = cfg_serial.Omx, OmB = cfg_serial.OmB, Omvac = cfg_serial.Omvac, h = cfg_serial.h,
+            n = cfg_serial.n, boxsize = cfg_serial.boxsize, nbuff = cfg_serial.nbuff,
+            z_out = cfg_serial.z_out, z_max = cfg_serial.z_max, ilpt = cfg_serial.ilpt,
+            rmax2rs = cfg_serial.rmax2rs, pkfile = cfg_serial.pkfile,
+            filterfile = cfg_serial.filterfile,
+            fileout = joinpath(tmpdir, "test_out_mpi_z1.pksc"), tabfile = cfg_serial.tabfile,
+        )
+        halos_mpi = Huntian.run_multitile_mpi(cfg_mpi; ntile=1, seed=42, verbose=false, comm=comm)
+
+        @test !isempty(halos_serial)          # guard against a vacuous pass
+        @test length(halos_serial) == length(halos_mpi)
+        if !isempty(halos_serial) && length(halos_serial) == length(halos_mpi)
+            sort!(halos_serial; by=h -> (h.x, h.y, h.z))
+            sort!(halos_mpi; by=h -> (h.x, h.y, h.z))
+            for f in (:vx, :vy, :vz, :vx2, :vy2, :vz2)
+                s = Float64[getfield(h, f) for h in halos_serial]
+                m = Float64[getfield(h, f) for h in halos_mpi]
+                # Float64 distributed FFT vs Float32 serial FFT: agree to a few %;
+                # a D/a slip is a factor 1+z = 2, a sign slip flips the 2LPT field.
+                @test isapprox(m, s; rtol=0.05)
+            end
+        end
+        rm(tmpdir; recursive=true)
+    end
+end
+
+@testset "MPI ntile=2 end-to-end (np=$nranks)" begin
+    tmpdir = mktempdir()
+    cfg = _make_config(tmpdir; n=20, boxsize=60.0, z=0.0, ilpt=1, nbuff=3)
+
+    halos = Huntian.run_multitile_mpi(cfg; ntile=2, seed=42, verbose=rank==0, comm=comm)
+
+    @test length(halos) >= 0  # should not error
+
+    if !isempty(halos)
+        @test all(h -> h.RTHL > 0, halos)
+    end
+
+    rm(tmpdir; recursive=true)
+end
+
+if nranks >= 2
+    @testset "MPI ntile=2 np=$nranks ≈ serial" begin
+        tmpdir = mktempdir()
+        cfg = _make_config(tmpdir; n=20, boxsize=60.0, z=0.0, ilpt=1, nbuff=3)
+
+        halos_serial = nothing
+        if rank == 0
+            halos_serial = Huntian.MultiTile.run_multitile(cfg; ntile=2, seed=42,
+                                                              verbose=false)
+        end
+
+        halos_mpi = Huntian.run_multitile_mpi(cfg; ntile=2, seed=42,
+                                                  verbose=false, comm=comm)
+
+        # run_multitile_mpi returns all halos on rank 0, empty on others
+        if rank == 0
+            @test length(halos_serial) == length(halos_mpi)
+
+            if !isempty(halos_serial) && !isempty(halos_mpi)
+                sort!(halos_serial; by=h -> (h.x, h.y, h.z))
+                sort!(halos_mpi; by=h -> (h.x, h.y, h.z))
+
+                for i in 1:min(length(halos_serial), length(halos_mpi))
+                    @test halos_serial[i].x ≈ halos_mpi[i].x atol=0.5
+                    @test halos_serial[i].y ≈ halos_mpi[i].y atol=0.5
+                    @test halos_serial[i].z ≈ halos_mpi[i].z atol=0.5
+                end
+            end
+        else
+            @test isempty(halos_mpi)
+        end
+
+        rm(tmpdir; recursive=true)
+    end
+end
+
+@testset "MPI lowmem ntile=2 matches standard (np=$nranks)" begin
+    tmpdir = mktempdir()
+    cfg = _make_config(tmpdir; n=20, boxsize=60.0, z=0.0, ilpt=2, nbuff=3)
+
+    halos_std = Huntian.run_multitile_mpi(cfg; ntile=2, seed=42,
+                                             verbose=false, comm=comm, lowmem=false)
+    halos_lm = Huntian.run_multitile_mpi(cfg; ntile=2, seed=42,
+                                            verbose=false, comm=comm, lowmem=true)
+
+    if rank == 0
+        @test length(halos_std) == length(halos_lm)
+
+        if !isempty(halos_std) && !isempty(halos_lm)
+            sort!(halos_std; by=h -> (h.x, h.y, h.z))
+            sort!(halos_lm; by=h -> (h.x, h.y, h.z))
+
+            for i in 1:length(halos_std)
+                @test halos_std[i].x ≈ halos_lm[i].x atol=1e-6
+                @test halos_std[i].y ≈ halos_lm[i].y atol=1e-6
+                @test halos_std[i].z ≈ halos_lm[i].z atol=1e-6
+                @test halos_std[i].RTHL ≈ halos_lm[i].RTHL atol=1e-6
+            end
+        end
+    else
+        @test isempty(halos_std)
+        @test isempty(halos_lm)
+    end
+
+    rm(tmpdir; recursive=true)
+end
+
+@testset "MPI lowmem ioutshear=1 matches standard (np=$nranks)" begin
+    tmpdir = mktempdir()
+    cfg = _make_config(tmpdir; n=20, boxsize=60.0, z=0.0, ilpt=2, nbuff=3,
+                       ioutshear=1, rmax2rs=1.0)
+
+    halos_std = Huntian.run_multitile_mpi(cfg; ntile=2, seed=42,
+                                             verbose=false, comm=comm, lowmem=false)
+    halos_lm = Huntian.run_multitile_mpi(cfg; ntile=2, seed=42,
+                                            verbose=false, comm=comm, lowmem=true)
+
+    if rank == 0
+        @test length(halos_std) == length(halos_lm)
+
+        if !isempty(halos_std) && !isempty(halos_lm)
+            sort!(halos_std; by=h -> (h.x, h.y, h.z))
+            sort!(halos_lm; by=h -> (h.x, h.y, h.z))
+
+            for i in 1:length(halos_std)
+                @test halos_std[i].x ≈ halos_lm[i].x atol=1e-6
+                @test halos_std[i].RTHL ≈ halos_lm[i].RTHL atol=1e-6
+                @test halos_std[i].e_v ≈ halos_lm[i].e_v atol=1e-4
+            end
+        end
+    end
+
+    rm(tmpdir; recursive=true)
+end
+
+rank == 0 && println("\nAll MPI tests passed (nranks=$nranks)")
+
+MPI.Finalize()

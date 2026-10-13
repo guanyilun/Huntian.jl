@@ -1,0 +1,221 @@
+#!/usr/bin/env julia
+# Validate multi-resolution split approach against global FFT.
+# Usage: julia --project=. test/test_multiresolution.jl
+
+using Huntian
+using Test
+
+function _make_config(dir; n=60, boxsize=100.0, z=0.0, ilpt=1, nbuff=8,
+                      ioutshear=0, rmax2rs=0.0, gaussian_split=false)
+    pk_path = joinpath(dir, "test_pk.dat")
+    ks = 10.0 .^ range(-4, stop=1, length=200)
+    open(pk_path, "w") do f
+        for k in ks
+            Pk = 1e4 * k^(-1.5)
+            println(f, "$k  $Pk")
+        end
+    end
+
+    filter_path = joinpath(dir, "test_filter.dat")
+    open(filter_path, "w") do f
+        println(f, "3")
+        println(f, "1  1.686  8.0")
+        println(f, "2  1.686  5.0")
+        println(f, "3  1.686  3.0")
+    end
+
+    cosmo = Huntian.CosmologyParams(0.31, 0.049, 0.69, 0.68, 0.965, 0.808)
+    ep = Huntian.EllipsoidParams(cosmo)
+    tp = Huntian.CollapseTableParams()
+    tab = Huntian.make_table(ep, tp)
+    tab_path = joinpath(dir, "test_table.dat")
+    Huntian.write_homeltab(tab_path, tab, tp)
+
+    cat_path = joinpath(dir, "test_output.pksc")
+
+    Huntian.PipelineConfig(
+        n=n, boxsize=Float64(boxsize), pkfile=pk_path, filterfile=filter_path,
+        tabfile=tab_path, fileout=cat_path, nbuff=nbuff,
+        z_out=Float64(z), ilpt=ilpt,
+        ioutshear=ioutshear, rmax2rs=rmax2rs,
+        ievol=0, z_max=0.0, cenx=0.0, ceny=0.0, cenz=0.0,
+        Omx=0.261, OmB=0.049, Omvac=0.69, h=0.68,
+        NonGauss=0, fNL=0.0, wsmooth=1, gaussian_split=gaussian_split,
+    )
+end
+
+# Simple P(k) interpolator for field-level tests
+function _make_pk()
+    tmpfile = tempname() * ".dat"
+    ks = 10.0 .^ range(-4, stop=1, length=200)
+    open(tmpfile, "w") do f
+        for k in ks
+            Pk = 1e4 * k^(-1.5)
+            println(f, "$k  $Pk")
+        end
+    end
+    pk = Huntian.load_pk(tmpfile)
+    rm(tmpfile)
+    return pk
+end
+
+@testset "Field-level accuracy (ntile=2, N=120)" begin
+    # N=120, ntile=2, nbuff=8 → nsub=52, nmesh=68
+    # coarse_factor=5 → M=10, block=12
+    N = 120; ntile = 2; nbuff = 8; cf = 5
+    boxsize = 400.0; seed = 42
+    pk = _make_pk()
+
+    results = compare_fields_split(pk, N, boxsize, seed, ntile, cf;
+                                    nbuff=nbuff, verbose=true)
+
+    for r in results
+        println("  Tile $(r.tile): corr_δ=$(round(r.corr_delta; digits=5)), " *
+                "rms_δ=$(round(r.rms_delta*100; digits=2))%, " *
+                "corr_ψ₁=$(round(r.corr_psi1; digits=5)), " *
+                "rms_ψ₁=$(round(r.rms_psi1*100; digits=2))%")
+    end
+
+    for r in results
+        @test r.corr_delta > 0.999
+        @test r.rms_delta < 0.05
+        @test r.corr_psi1 > 0.93
+        @test r.rms_psi1 < 0.40
+    end
+end
+
+@testset "Coarse factor sweep (N=120)" begin
+    N = 120; ntile = 2; nbuff = 8
+    boxsize = 400.0; seed = 42
+    pk = _make_pk()
+
+    # Accuracy is NOT monotonic in cf. Small cf → better delta (residual is
+    # more short-range) but worse ψ₁ (coarse grid too coarse for 1/k² modes).
+    # Large cf → worse delta (residual has long modes) but better ψ₁.
+    # cf=3-5 is optimal for halo counts (delta-dominated).
+    for cf in [3, 5, 6, 10, 20]
+        results = compare_fields_split(pk, N, boxsize, seed, ntile, cf;
+                                        nbuff=nbuff, verbose=false)
+        mean_corr_d = sum(r.corr_delta for r in results) / length(results)
+        mean_rms_d = sum(r.rms_delta for r in results) / length(results)
+        mean_corr_p = sum(r.corr_psi1 for r in results) / length(results)
+        mean_rms_p = sum(r.rms_psi1 for r in results) / length(results)
+        println("  cf=$cf (M=$(2*cf), block=$(N÷(2*cf))): " *
+                "δ: corr=$(round(mean_corr_d; digits=5)) rms=$(round(mean_rms_d*100; digits=2))% | " *
+                "ψ₁: corr=$(round(mean_corr_p; digits=5)) rms=$(round(mean_rms_p*100; digits=2))%")
+
+        @test mean_corr_d > 0.99
+        @test mean_rms_d < 0.15
+    end
+end
+
+@testset "Halo count comparison (ntile=2, 1LPT)" begin
+    tmpdir = mktempdir()
+    # n=68, nbuff=8 → nsub=52, N=120. cf=5→M=10 divides 120.
+    cfg = _make_config(tmpdir; n=68, boxsize=226.67, z=0.0, ilpt=1, nbuff=8)
+
+    halos_global = Huntian.run_multitile(cfg; ntile=2, seed=42, verbose=false)
+    halos_split = Huntian.run_multitile_split(cfg; ntile=2, seed=42, verbose=true,
+                                                  coarse_factor=5)
+
+    n_g = length(halos_global)
+    n_s = length(halos_split)
+    println("  Global FFT: $n_g halos")
+    println("  Split mode: $n_s halos")
+
+    if n_g > 0
+        frac_diff = abs(n_s - n_g) / n_g
+        println("  Fractional difference: $(round(frac_diff*100; digits=1))%")
+        @test frac_diff < 0.05 || abs(n_s - n_g) <= 3  # <5% or ≤3 halos
+    end
+
+    rm(tmpdir; recursive=true)
+end
+
+@testset "Halo count comparison (ntile=2, 2LPT)" begin
+    tmpdir = mktempdir()
+    cfg = _make_config(tmpdir; n=68, boxsize=226.67, z=0.0, ilpt=2, nbuff=8)
+
+    halos_global = Huntian.run_multitile(cfg; ntile=2, seed=42, verbose=false)
+    halos_split = Huntian.run_multitile_split(cfg; ntile=2, seed=42, verbose=false,
+                                                  coarse_factor=5)
+
+    n_g = length(halos_global)
+    n_s = length(halos_split)
+    println("  Global FFT (2LPT): $n_g halos")
+    println("  Split mode (2LPT): $n_s halos")
+
+    if n_g > 0
+        frac_diff = abs(n_s - n_g) / n_g
+        println("  Fractional difference: $(round(frac_diff*100; digits=1))%")
+        @test frac_diff < 0.05 || abs(n_s - n_g) <= 3
+    end
+
+    rm(tmpdir; recursive=true)
+end
+
+@testset "Gaussian split: isolated Poisson ψ of a compact blob" begin
+    # _isolated_poisson_psi returns ψ_k = i k δ_k / k² with isolated boundaries, i.e. the free-space
+    # solution: for a Gaussian blob δ = exp(−r²/2s²), ψ_r(r) = −(1/r²) ∫₀^r δ r'² dr'.
+    MR = Huntian.MultiResolution
+    n = 48; L = 48.0; s = 2.5; c = (n + 1) / 2
+    δ = Float32[exp(-((i - c)^2 + (j - c)^2 + (k - c)^2) / (2s^2)) for i in 1:n, j in 1:n, k in 1:n]
+    ψx, ψy, ψz = MR._isolated_poisson_psi(δ, L)
+    encl(R) = begin h = R / 4000; sum(exp(-((m - 0.5) * h)^2 / (2s^2)) * ((m - 0.5) * h)^2 for m in 1:4000) * h end
+    jc = Int(c + 0.5)                                            # cell centre offset (0.5, 0.5) from the blob centre in y, z
+    for di in (3, 5, 8, 12)
+        i = jc + di; r = i - c; R = sqrt(r^2 + 0.5)
+        @test ψx[i, jc, jc] ≈ -encl(R) / R^2 * (r / R) rtol = 0.03
+        @test ψx[n + 1 - i, jc, jc] ≈ -ψx[i, jc, jc] rtol = 0.03  # antisymmetry about the centre
+    end
+end
+
+@testset "Halo count comparison, gaussian_split (ntile=2, 2LPT)" begin
+    tmpdir = mktempdir()
+    # n=76, nbuff=12 → nsub 52, N=128; cf 8 → M 16, block 8 → r_s = 6 ∈ [block/2, nbuff/2]
+    cfg = _make_config(tmpdir; n=76, boxsize=253.33, z=0.0, ilpt=2, nbuff=12)
+    cfg_g = _make_config(tmpdir; n=76, boxsize=253.33, z=0.0, ilpt=2, nbuff=12, gaussian_split=true)
+    halos_global = Huntian.run_multitile(cfg; ntile=2, seed=42, verbose=false)
+    # profile=true exercises the per-tile timer path
+    halos_split = Huntian.run_multitile_split(cfg_g; ntile=2, seed=42, verbose=false, coarse_factor=8, profile=true)
+    n_g = length(halos_global); n_s = length(halos_split)
+    println("  Global FFT: $n_g halos; gaussian_split: $n_s halos")
+    @test n_g > 0
+    @test abs(n_s - n_g) / n_g < 0.05 || abs(n_s - n_g) <= 3
+    rm(tmpdir; recursive=true)
+end
+
+@testset "Gaussian split: handoff scale guard" begin
+    rs = Huntian.MultiResolution._gaussian_split_rs
+    @test rs(0.0, 12, 25) == 9.0                 # default: 0.75·block
+    @test rs(0.0, 24, 25) == 12.5                # capped at nbuff/2
+    @test rs(6.0, 12, 25) == 6.0
+    @test_throws ErrorException rs(0.0, 66, 25)  # block > nbuff: no valid r_s
+    @test_throws ErrorException rs(4.0, 12, 25)  # below block/2
+    @test_throws ErrorException rs(14.0, 12, 25) # above nbuff/2
+end
+
+@testset "Splice compensation D/T" begin
+    # Coarse factor Π D(k)/T(k) (MultiResolution._splice_compensation): unity at k=0, even,
+    # bounded, and equal to an independent evaluation of the block-average transfer D and the
+    # Catmull-Rom transfer T. With the factor, 1 + D(T·(D/T) − D) = 1 at low k.
+    MR = Huntian.MultiResolution
+    for (M, b) in ((64, 12), (96, 8), (40, 6))
+        c = MR._splice_compensation(M, b)
+        @test c[1] ≈ 1.0 atol=1e-7
+        @test all(j -> c[j+1] ≈ c[M-j+1], 1:M-1)
+        @test all(x -> 0.5 < x < 1.5, c)
+        cr(t) = (-0.5t^3 + t^2 - 0.5t, 1.5t^3 - 2.5t^2 + 1, -1.5t^3 + 2t^2 + 0.5t, 0.5t^3 - 0.5t^2)
+        for j in (1, 3, M ÷ 4)
+            θ = 2π * j / (M * b)
+            D = sin(b * θ / 2) / (b * sin(θ / 2))
+            T = sum(sum(w * cos(b * θ * ((s + 0.5) / b + 0.5 - (floor((s + 0.5) / b + 0.5) + d)))
+                        for (d, w) in zip(-1:2, cr((s + 0.5) / b + 0.5 - floor((s + 0.5) / b + 0.5))))
+                    for s in 0:b-1) / b
+            @test c[j+1] ≈ D / T rtol=1e-5
+            @test 1 + D * (T * c[j+1] - D) ≈ 1 atol=1e-5
+        end
+    end
+end
+
+println("\nAll multi-resolution tests completed.")

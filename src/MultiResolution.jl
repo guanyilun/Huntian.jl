@@ -1,0 +1,1492 @@
+module MultiResolution
+
+# Multi-resolution field generation following Hahn & Abel (2011, MUSIC).
+#
+# Instead of a global N³ FFT, splits the convolution T*ξ into:
+#   δ_coarse : contribution from coarse-grid noise (captures long modes)
+#   δ_self   : contribution from tile-local residual noise (isolated FFT)
+#
+# The split is at the white-noise level (not the power spectrum), following
+# the Hoffman-Ribak constrained realization, so no taper function is needed.
+
+using FFTW
+using Printf: @sprintf
+
+using ..Cosmology: CosmologyParams, Dlinear_tables, Dlinear_ab, chi, chi_cmb, omega_m_a,
+    build_chi_to_z, chi_to_z, peak_redshift
+using ..PowerSpectrum: load_pk
+using ..RandomField: _threefry_gaussian, generate_grf, fill_noise_threefry!
+using ..LPT
+using ..LPT: displacements_1lpt
+using ..Filters: smooth_field, gaussian_window_fortran, tophat_window, read_filterbank
+using ..PeakFind: PeakCandidate, find_peaks
+using ..RadialShell: PeakGrid, precompute_shells, analyse_peak, fsc_of_z
+using ..ShellAnalysisGPU: build_shell_tables
+using ..Parameters: PipelineConfig, grid_layout
+using ..Catalog: HaloRecord, ExtHaloRecord
+using ..CollapseTable: CollapseTableInterp, read_homeltab
+using ..MultiTile: tile_center, extract_tile
+
+export run_multitile_split, compare_fields_split
+
+"""
+Generate Threefry noise for a tile's region of the global N³ grid.
+Returns nmesh³ array with the exact same noise values as the global grid.
+"""
+function _generate_tile_noise(it::Int, jt::Int, kt::Int,
+                               nsub::Int, nmesh::Int, N::Int, seed::Integer)
+    nbuff = (nmesh - nsub) ÷ 2
+    noise = Array{Float32,3}(undef, nmesh, nmesh, nmesh)
+    s = UInt64(seed)
+    i0 = (it - 1) * nsub + 1 - nbuff
+    j0 = (jt - 1) * nsub + 1 - nbuff
+    k0 = (kt - 1) * nsub + 1 - nbuff
+
+    Threads.@threads for lk in 1:nmesh
+        @inbounds for lj in 1:nmesh, li in 1:nmesh
+            gi = mod1(i0 + li - 1, N)
+            gj = mod1(j0 + lj - 1, N)
+            gk = mod1(k0 + lk - 1, N)
+            idx = gi + (gj - 1) * N + (gk - 1) * N * N
+            pair_idx = UInt64((idx - 1) >> 1)
+            g1, g2 = _threefry_gaussian(s, pair_idx)
+            noise[li, lj, lk] = Float32(iseven(idx - 1) ? g1 : g2)
+        end
+    end
+    return noise
+end
+
+"""
+Downsample fine-grid noise to coarse grid by block-averaging.
+Each coarse cell (I,J,K) = mean of block³ fine cells.
+Normalized so that coarse noise has unit variance per cell.
+"""
+function _downsample_noise(N::Int, M::Int, seed::Integer)
+    block = N ÷ M
+    coarse = zeros(Float64, M, M, M)
+    s = UInt64(seed)
+
+    Threads.@threads for K in 1:M
+        for J in 1:M, I in 1:M
+            val = 0.0
+            for dk in 0:block-1, dj in 0:block-1, di in 0:block-1
+                gi = (I - 1) * block + di + 1
+                gj = (J - 1) * block + dj + 1
+                gk = (K - 1) * block + dk + 1
+                idx = gi + (gj - 1) * N + (gk - 1) * N * N
+                pair_idx = UInt64((idx - 1) >> 1)
+                g1, g2 = _threefry_gaussian(s, pair_idx)
+                val += Float64(iseven(idx - 1) ? g1 : g2)
+            end
+            coarse[I, J, K] = val / sqrt(Float64(block)^3)
+        end
+    end
+    return Float32.(coarse)
+end
+
+"""
+Interpolate the periodic coarse grid onto a tile's fine cells with tri-cubic
+(Catmull-Rom) interpolation, cell-centred on both grids.
+"""
+function _interpolate_to_tile(coarse::Array{Float32,3},
+                               it::Int, jt::Int, kt::Int,
+                               nsub::Int, nmesh::Int, N::Int, M::Int)
+    block = N ÷ M
+    nbuff = (nmesh - nsub) ÷ 2
+    tile = Array{Float32,3}(undef, nmesh, nmesh, nmesh)
+
+    i0 = (it - 1) * nsub + 1 - nbuff
+    j0 = (jt - 1) * nsub + 1 - nbuff
+    k0 = (kt - 1) * nsub + 1 - nbuff
+
+    Threads.@threads for lk in 1:nmesh
+        @inbounds for lj in 1:nmesh, li in 1:nmesh
+            gi = mod1(i0 + li - 1, N)
+            gj = mod1(j0 + lj - 1, N)
+            gk = mod1(k0 + lk - 1, N)
+
+            # Fractional coarse coordinate (1-based, cell-centred)
+            fx = (gi - 0.5) / block + 0.5
+            fy = (gj - 0.5) / block + 0.5
+            fz = (gk - 0.5) / block + 0.5
+
+            tile[li, lj, lk] = _tricubic(coarse, fx, fy, fz, M)
+        end
+    end
+    return tile
+end
+
+"""
+Nearest-neighbor spreading of coarse grid to fine tile grid.
+Each fine cell gets the value of the coarse cell it belongs to.
+This preserves the Hoffman-Ribak property: residual = fine - spread(coarse)
+has exactly zero mean per coarse cell.
+"""
+function _spread_coarse_to_tile(coarse::Array{Float32,3},
+                                it::Int, jt::Int, kt::Int,
+                                nsub::Int, nmesh::Int, N::Int, M::Int)
+    block = N ÷ M
+    nbuff = (nmesh - nsub) ÷ 2
+    tile = Array{Float32,3}(undef, nmesh, nmesh, nmesh)
+
+    i0 = (it - 1) * nsub + 1 - nbuff
+    j0 = (jt - 1) * nsub + 1 - nbuff
+    k0 = (kt - 1) * nsub + 1 - nbuff
+
+    Threads.@threads for lk in 1:nmesh
+        @inbounds for lj in 1:nmesh, li in 1:nmesh
+            gi = mod1(i0 + li - 1, N)
+            gj = mod1(j0 + lj - 1, N)
+            gk = mod1(k0 + lk - 1, N)
+            ci = (gi - 1) ÷ block + 1
+            cj = (gj - 1) ÷ block + 1
+            ck = (gk - 1) ÷ block + 1
+            tile[li, lj, lk] = coarse[ci, cj, ck]
+        end
+    end
+    return tile
+end
+
+"""Catmull-Rom weights for points at offsets -1, 0, 1, 2, for fractional offset t ∈ [0,1)."""
+@inline function _catmull_rom(t::Float32)
+    t2 = t * t; t3 = t2 * t
+    w0 = -0.5f0 * t3 + t2 - 0.5f0 * t
+    w1 =  1.5f0 * t3 - 2.5f0 * t2 + 1.0f0
+    w2 = -1.5f0 * t3 + 2.0f0 * t2 + 0.5f0 * t
+    w3 =  0.5f0 * t3 - 0.5f0 * t2
+    return (w0, w1, w2, w3)
+end
+
+"""Tri-cubic (Catmull-Rom) interpolation with periodic wrapping on M³ grid."""
+function _tricubic(field::Array{Float32,3}, fx, fy, fz, M)
+    ix = floor(Int, fx); dx = Float32(fx - ix)
+    iy = floor(Int, fy); dy = Float32(fy - iy)
+    iz = floor(Int, fz); dz = Float32(fz - iz)
+
+    wx = _catmull_rom(dx)
+    wy = _catmull_rom(dy)
+    wz = _catmull_rom(dz)
+
+    val = 0.0f0
+    @inbounds for (dkk, wk) in zip(-1:2, wz)
+        kk = mod1(iz + dkk, M)
+        for (djj, wj) in zip(-1:2, wy)
+            jj = mod1(iy + djj, M)
+            for (dii, wi) in zip(-1:2, wx)
+                ii = mod1(ix + dii, M)
+                val += wi * wj * wk * field[ii, jj, kk]
+            end
+        end
+    end
+    return val
+end
+
+"""
+Generate the Hoffman-Ribak residual noise for an extended region around a tile.
+The extended region has size (nmesh + 2*nshell)³, centered on the tile.
+The residual = fine_noise - nearest_neighbor(coarse_block_mean) has exactly
+zero mean per coarse cell, ensuring T*residual is short-range.
+"""
+function _generate_extended_residual(it::Int, jt::Int, kt::Int,
+                                      nsub::Int, nmesh::Int, N::Int, seed::Integer,
+                                      coarse_noise::Array{Float32,3}, M::Int,
+                                      nshell::Int)
+    block = N ÷ M
+    nbuff = (nmesh - nsub) ÷ 2
+    next = nmesh + 2 * nshell
+    inv_sqrt_block3 = Float32(1.0 / sqrt(Float64(block)^3))
+    s = UInt64(seed)
+
+    i0 = (it - 1) * nsub + 1 - nbuff - nshell
+    j0 = (jt - 1) * nsub + 1 - nbuff - nshell
+    k0 = (kt - 1) * nsub + 1 - nbuff - nshell
+
+    residual = Array{Float32,3}(undef, next, next, next)
+
+    Threads.@threads for lk in 1:next
+        @inbounds for lj in 1:next, li in 1:next
+            gi = mod1(i0 + li - 1, N)
+            gj = mod1(j0 + lj - 1, N)
+            gk = mod1(k0 + lk - 1, N)
+
+            idx = gi + (gj - 1) * N + (gk - 1) * N * N
+            pair_idx = UInt64((idx - 1) >> 1)
+            g1, g2 = _threefry_gaussian(s, pair_idx)
+            fine_val = Float32(iseven(idx - 1) ? g1 : g2)
+
+            # coarse_noise is the block sum / √block³, so this is the block mean
+            ci = (gi - 1) ÷ block + 1
+            cj = (gj - 1) ÷ block + 1
+            ck = (gk - 1) ÷ block + 1
+            block_mean = coarse_noise[ci, cj, ck] * inv_sqrt_block3
+
+            residual[li, lj, lk] = fine_val - block_mean
+        end
+    end
+    return residual
+end
+
+"""
+Isolated (non-periodic) FFT convolution of noise with transfer function √P(k).
+Zero-pads to 2× size to avoid circular wrap-around.
+
+When `nshell > 0`, the input noise is an extended (nmesh+2*nshell)³ array
+centered on the tile. The result is trimmed to the tile's nmesh³ region,
+capturing boundary contributions from the shell.
+"""
+function _isolated_convolve(noise::Array{Float32,3}, pk, boxsize_local::Float64,
+                             n::Int; kernel_fn=nothing, nshell::Int=0)
+    n_input = size(noise, 1)  # n (no shell) or n + 2*nshell
+    dx = boxsize_local / n    # cell size (same for tile and extended region)
+    boxsize_ext = n_input * dx
+    n2 = 2 * n_input
+
+    padded = zeros(Float32, n2, n2, n2)
+    padded[1:n_input, 1:n_input, 1:n_input] .= noise
+
+    padded_k = rfft(padded)
+
+    dk = 2π / (n2 * dx)  # dk for the padded box
+    kx_arr = FFTW.rfftfreq(n2, n2 * dk)
+    ky_arr = FFTW.fftfreq(n2, n2 * dk)
+    kz_arr = FFTW.fftfreq(n2, n2 * dk)
+
+    for iz in 1:n2, iy in 1:n2, ix in 1:size(padded_k, 1)
+        kx = Float64(kx_arr[ix]); ky = Float64(ky_arr[iy]); kz = Float64(kz_arr[iz])
+        k2 = kx^2 + ky^2 + kz^2
+        if k2 == 0.0
+            padded_k[ix, iy, iz] = 0
+            continue
+        end
+        k = sqrt(k2)
+        amp = sqrt(pk(k) * dk^3 * n2^3)
+        if kernel_fn !== nothing
+            padded_k[ix, iy, iz] *= amp * kernel_fn(kx, ky, kz, k2)
+        else
+            padded_k[ix, iy, iz] *= amp
+        end
+    end
+
+    result = irfft(padded_k, n2)
+    s1 = nshell + 1; s2 = nshell + n
+    return result[s1:s2, s1:s2, s1:s2]
+end
+
+"""
+    _gaussian_split_rs(rs_cfg, block, nbuff) -> r_s in fine cells
+
+Handoff scale for `gaussian_split`. Two constraints:
+- r_s ≥ block/2, so the coarse level is negligible at its Nyquist: G(k_N) = exp(−(π r_s/block)²) ≤ 0.085.
+- r_s ≤ nbuff/2, so the isolated tile solves contain the short-range kernel.
+
+Default: min(0.75·block, nbuff/2). Errors if no r_s satisfies both, i.e. block > nbuff (use a larger
+coarse_factor or nbuff).
+"""
+function _gaussian_split_rs(rs_cfg::Real, block::Integer, nbuff::Integer)
+    rs = rs_cfg > 0 ? Float64(rs_cfg) : min(0.75 * block, 0.5 * nbuff)
+    lo, hi = 0.5 * block, 0.5 * nbuff
+    lo <= rs <= hi + 1e-9 || error("gaussian_split: r_s = $(rs) cells outside [block/2, nbuff/2] = [$(lo), $(hi)] " *
+        "(block $(block), nbuff $(nbuff)); " * (lo > hi ? "the coarse block is larger than the buffer — use a larger coarse_factor or nbuff" :
+        "choose gaussian_split_rs in this range"))
+    return rs
+end
+
+"""
+    _isolated_poisson_psi(f, boxsize_local) -> NTuple{3,Array{Float32,3}}
+
+1LPT displacement ψ_k = i k δ_k / k² of a tile-local density `f`, with isolated (2×-zero-padded)
+boundary conditions: the field outside the tile is taken as zero. One forward FFT. Used by `gaussian_split`
+on the short-range part δ_S of the tile density.
+"""
+function _isolated_poisson_psi(f::Array{Float32,3}, boxsize_local::Float64)
+    n = size(f, 1); n2 = 2n; dx = boxsize_local / n
+    padded = zeros(Float32, n2, n2, n2)
+    padded[1:n, 1:n, 1:n] .= f
+    fk = rfft(padded); padded = nothing
+    dk = 2π / (n2 * dx)
+    kxa = FFTW.rfftfreq(n2, n2 * dk); kya = FFTW.fftfreq(n2, n2 * dk)
+    out = ntuple(3) do comp
+        g = similar(fk)
+        Threads.@threads for iz in 1:n2
+            @inbounds for iy in 1:n2, ix in 1:size(fk, 1)
+                kx = Float64(kxa[ix]); ky = Float64(kya[iy]); kz = Float64(kya[iz])
+                k2 = kx^2 + ky^2 + kz^2
+                nyq = ix == size(fk, 1) || iy == n + 1 || iz == n + 1     # padded Nyquist planes (GPU parity)
+                if k2 == 0.0 || nyq
+                    g[ix, iy, iz] = zero(eltype(g))
+                else
+                    ki = comp == 1 ? kx : comp == 2 ? ky : kz
+                    g[ix, iy, iz] = fk[ix, iy, iz] * (im * ki / k2)
+                end
+            end
+        end
+        Float32.(irfft(g, n2)[1:n, 1:n, 1:n])
+    end
+    return out
+end
+
+"""
+    _isolated_short_pot(f, boxsize_local, rs) -> Array{Float32,3}
+
+Short-range potential −(1 − e^{−k²r_s²})/k² · δ of the full tile density `f` (`rs` in Mpc/h), isolated
+(2×-zero-padded). Its Green function erfc(r/2r_s)/4πr is local, so tiles agree on their shared cells up to
+the sources beyond the buffer. Solving −1/k² on the truncated short part δ_S instead leaves a per-tile offset
+and gradient (the truncated field's net charge), which is discontinuous across tile faces.
+"""
+function _isolated_short_pot(f::Array{Float32,3}, boxsize_local::Float64, rs::Float64)
+    n = size(f, 1); n2 = 2n; dx = boxsize_local / n
+    padded = zeros(Float32, n2, n2, n2)
+    padded[1:n, 1:n, 1:n] .= f
+    fk = rfft(padded); padded = nothing
+    dk = 2π / (n2 * dx); rs2 = rs^2
+    kxa = FFTW.rfftfreq(n2, n2 * dk); kya = FFTW.fftfreq(n2, n2 * dk)
+    Threads.@threads for iz in 1:n2
+        @inbounds for iy in 1:n2, ix in 1:size(fk, 1)
+            k2 = Float64(kxa[ix])^2 + Float64(kya[iy])^2 + Float64(kya[iz])^2
+            fk[ix, iy, iz] *= k2 == 0.0 ? -rs2 : -(1 - exp(-k2 * rs2)) / k2
+        end
+    end
+    return Float32.(irfft(fk, n2)[1:n, 1:n, 1:n])
+end
+
+"""
+    _gsplit_setup(coarse_noise, pk, M, boxsize_full, comp, rs_cells, alatt; need_pot=false)
+
+Long-range coarse fields for `gaussian_split`: G·δ, G·ψ (and G·potential), G = exp(−k² r_s²), from the
+same coarse noise with the same compensation (so δ_L, ψ_L stay a Poisson pair after interpolation), plus
+`pk_short(k) = P(k)(1 − G)²` for the tile's short part of the spread block mean, and `rs` [Mpc/h].
+"""
+function _gsplit_setup(coarse_noise, pk, M::Int, boxsize_full::Float64, comp, rs_cells::Float64,
+                       alatt::Float64; need_pot::Bool=false)
+    rs2 = (rs_cells * alatt)^2
+    G(k2) = exp(-k2 * rs2)
+    conv(kern) = (q = rfft(coarse_noise); _periodic_convolve!(q, pk, M, boxsize_full; kernel_fn=kern, comp=comp); irfft(q, M))
+    dL = conv((kx, ky, kz, k2) -> G(k2))
+    psiL = [conv((kx, ky, kz, k2) -> G(k2) * _kernel_1lpt(d)(kx, ky, kz, k2)) for d in 1:3]
+    potL = need_pot ? conv((kx, ky, kz, k2) -> G(k2) * _kernel_pot()(kx, ky, kz, k2)) : nothing
+    pk_short = k -> pk(k) * (1 - exp(-k^2 * rs2))^2
+    return (dL=dL, psiL=psiL, potL=potL, pk_short=pk_short, rs=rs_cells * alatt)
+end
+
+"""
+    _gsplit_tile(gs, use_gpu, delta_self, coarse_noise, it, jt, kt, nsub, nmesh, N, M, boxsize_local; need_pot=false)
+        -> (delta_tile, psi_tile::Vector, pot_tile or nothing)
+
+Tile fields under `gaussian_split`: δ_S = δ_self (√P·residual) + isolated[(1 − G)√P · spread(block mean)],
+δ = interp(δ_L) + δ_S, ψ = interp(ψ_L) + isolated Poisson(δ_S), potential = interp(G·φ) + `_isolated_short_pot(δ)`.
+Host Arrays on the CPU,
+CuArrays on the GPU (`delta_self` must already live there).
+"""
+function _gsplit_tile(gs, use_gpu::Bool, delta_self, coarse_noise, it::Int, jt::Int, kt::Int,
+                      nsub::Int, nmesh::Int, N::Int, M::Int, boxsize_local::Float64; need_pot::Bool=false)
+    block = N ÷ M
+    pc = _spread_coarse_to_tile(coarse_noise, it, jt, kt, nsub, nmesh, N, M) .* Float32(1 / sqrt(Float64(block)^3))
+    if use_gpu
+        fn_int = getglobal(_pp_parent(), :interpolate_to_tile_gpu)
+        pcS = getglobal(_pp_parent(), :isolated_convolve_gpu_multi)(pc, gs.pk_short, boxsize_local, nmesh;
+                        kernels=[(0, 0, 0)], nshell=0, return_device=true)[1]
+        dS = delta_self .+ pcS
+        pcS = nothing
+        delta = dS .+ fn_int(gs.dL, it, jt, kt, nsub, nmesh, N, M; return_device=true)
+        sol = getglobal(_pp_parent(), :isolated_poisson_psi_gpu)(dS, boxsize_local)
+        dS = nothing
+        psi = Any[fn_int(gs.psiL[d], it, jt, kt, nsub, nmesh, N, M; return_device=true) .+ sol[d] for d in 1:3]
+        pot = need_pot ? fn_int(gs.potL, it, jt, kt, nsub, nmesh, N, M; return_device=true) .+
+                         getglobal(_pp_parent(), :isolated_short_pot_gpu)(delta, boxsize_local, gs.rs) : nothing
+    else
+        dS = delta_self .+ _isolated_convolve(pc, gs.pk_short, boxsize_local, nmesh)
+        delta = dS .+ _interpolate_to_tile(gs.dL, it, jt, kt, nsub, nmesh, N, M)
+        sol = _isolated_poisson_psi(dS, boxsize_local)
+        psi = Any[_interpolate_to_tile(gs.psiL[d], it, jt, kt, nsub, nmesh, N, M) .+ sol[d] for d in 1:3]
+        pot = need_pot ? _interpolate_to_tile(gs.potL, it, jt, kt, nsub, nmesh, N, M) .+
+                         _isolated_short_pot(delta, boxsize_local, gs.rs) : nothing
+    end
+    return delta, psi, pot
+end
+
+"""
+    _splice_compensation(M, block) -> Vector{Float64}
+
+Per-axis coarse-kernel factor D(k)/T(k) on the M-point coarse grid (fftfreq order;
+even in k). The tile field is interp_CR(coarse) + K*(n − spread_pc(block mean)); below
+the coarse Nyquist that equals K*n·[1 + D(T − D)] per axis product, with
+  D(θ) = sin(bθ/2)/(b sin(θ/2))   block-average (cell-centred) transfer, θ = k·dx_fine,
+  T(θ) = ⟨Σ_d w_d(t) e^{-ibθ(f−i−d)}⟩_fine   Catmull-Rom interpolation transfer
+         projected on the fine-grid mode (average over the b fine sub-positions).
+Multiplying the coarse kernels by Π D/T makes the stitched field exact there (without it
+the split power is ~2-11% high between 0.16 and 0.62 k_Nyq,coarse). Aliased images above
+the coarse Nyquist are not diagonal in k and are unaffected.
+"""
+function _splice_compensation(M::Int, block::Int)
+    b = block
+    c = zeros(Float64, M)
+    for j in 0:M-1
+        js = j <= M ÷ 2 ? j : j - M                      # signed coarse wavenumber index
+        θ = 2π * js / (M * b)                             # k · dx_fine
+        D = js == 0 ? 1.0 : sin(b * θ / 2) / (b * sin(θ / 2))
+        T = 0.0 + 0.0im
+        for s in 0:b-1
+            f = (s + 0.5) / b + 0.5; i = floor(Int, f); t = f - i
+            w = _catmull_rom(Float32(t))
+            for (d, wd) in zip(-1:2, w)
+                T += Float64(wd) * cis(-b * θ * (f - (i + d)))
+            end
+        end
+        T /= b
+        c[j+1] = clamp(D / real(T), 0.0, 2.0)
+    end
+    c
+end
+
+"""Apply √P(k) (times optional `kernel_fn`) to periodic k-space noise in place.
+`comp` (optional per-axis vector from `_splice_compensation`) multiplies by Π comp."""
+function _periodic_convolve!(noise_k, pk, n::Int, boxsize::Float64;
+                              kernel_fn=nothing, comp=nothing)
+    dk = 2π / boxsize
+    kx_arr = FFTW.rfftfreq(n, n * dk)
+    ky_arr = FFTW.fftfreq(n, n * dk)
+    kz_arr = FFTW.fftfreq(n, n * dk)
+
+    for iz in 1:n, iy in 1:n, ix in 1:size(noise_k, 1)
+        kx = Float64(kx_arr[ix]); ky = Float64(ky_arr[iy]); kz = Float64(kz_arr[iz])
+        k2 = kx^2 + ky^2 + kz^2
+        if k2 == 0.0
+            noise_k[ix, iy, iz] = 0
+            continue
+        end
+        k = sqrt(k2)
+        amp = sqrt(pk(k) * dk^3 * n^3)
+        comp !== nothing && (amp *= comp[ix] * comp[iy] * comp[iz])
+        if kernel_fn !== nothing
+            noise_k[ix, iy, iz] *= amp * kernel_fn(kx, ky, kz, k2)
+        else
+            noise_k[ix, iy, iz] *= amp
+        end
+    end
+end
+
+# k-space kernels f(kx, ky, kz, k²); ids in `_isolated_convolve_dispatch`.
+_kernel_1lpt(dim) = (kx, ky, kz, k2) -> begin
+    ki = dim == 1 ? kx : dim == 2 ? ky : kz
+    return im * ki / k2
+end
+
+_kernel_2lpt(dim) = (kx, ky, kz, k2) -> begin
+    ki = dim == 1 ? kx : dim == 2 ? ky : kz
+    return -im * ki / k2
+end
+
+_kernel_phi_ij(di, dj) = (kx, ky, kz, k2) -> begin
+    ki = di == 1 ? kx : di == 2 ? ky : kz
+    kj = dj == 1 ? kx : dj == 2 ? ky : kz
+    return -ki * kj / k2
+end
+
+_kernel_laplacian() = (kx, ky, kz, k2) -> k2
+
+# Inverse Laplacian ∇⁻²δ (potential up to the Poisson prefactor): pot(k) = -δ(k)/k²
+_kernel_pot() = (kx, ky, kz, k2) -> -1 / k2
+
+# GPU entry points (`isolated_convolve_gpu`, ...) are stubs in the parent module
+# filled in by ext/CUDAExt.jl; they are looked up by name at call time.
+@inline _pp_parent() = parentmodule(@__MODULE__)
+
+"""
+    _isolated_convolve_dispatch(use_gpu, noise, pk, boxsize, n, kernel_id, dim1, dim2; nshell)
+
+Shared entry point used by `run_multitile_split`. Calls the CPU
+`_isolated_convolve` or the GPU `isolated_convolve_gpu` based on `use_gpu`.
+`kernel_id` matches the CUDA kernel IDs:
+  0=δ, 1=1LPT (uses `dim1`), 2=2LPT (uses `dim1`),
+  3=φ_ij (uses `dim1`, `dim2`), 4=Laplacian, 5=∇⁻² (potential).
+"""
+function _isolated_convolve_dispatch(use_gpu::Bool, noise::Array{Float32,3}, pk,
+                                      boxsize::Float64, n::Int,
+                                      kernel_id::Int, dim1::Int, dim2::Int;
+                                      nshell::Int=0)
+    if use_gpu
+        fn = getglobal(_pp_parent(), :isolated_convolve_gpu)
+        return fn(noise, pk, boxsize, n;
+                  kernel_fn_id=kernel_id, dim1=dim1, dim2=dim2, nshell=nshell)
+    end
+    kf = kernel_id == 0 ? nothing :
+         kernel_id == 1 ? _kernel_1lpt(dim1) :
+         kernel_id == 2 ? _kernel_2lpt(dim1) :
+         kernel_id == 3 ? _kernel_phi_ij(dim1, dim2) :
+         kernel_id == 4 ? _kernel_laplacian() :
+         kernel_id == 5 ? _kernel_pot() :
+         error("bad kernel_id $kernel_id")
+    return _isolated_convolve(noise, pk, boxsize, n; kernel_fn=kf, nshell=nshell)
+end
+
+"""
+    _gpu_analyse_peaks_batch(delta_tile, psi_tile, psi2_tile, lapd_tile, mask,
+                             peaks, Rf_per_peak, stab_gpu, ct_table_gpu,
+                             ct_params, alatt, ZZon, nbuff, rmax2rs, ct)
+
+Batched GPU shell analysis: groups peaks by filter scale Rf (so `ir2min`,
+`Rfclvi` are uniform per batch) and invokes `analyse_peak_gpu_cuda` once per
+group. Returns a Vector of NamedTuple-like results indexed the same as `peaks`.
+Slots for peaks that no-collapse-on-GPU retain `RTHL = -1.0f0`.
+"""
+function _gpu_analyse_peaks_batch(delta_tile,
+                                    psi_x, psi_y, psi_z,
+                                    psi2_x, psi2_y, psi2_z,
+                                    lapd_tile, mask::Array{Int8,3},
+                                    peaks::Vector{PeakCandidate},
+                                    Rf_per_peak::Vector{Float64},
+                                    stab_gpu, ct_table_gpu,
+                                    ct_params, alatt::Float64,
+                                    ZZon::Float64, nbuff::Int,
+                                    rmax2rs::Float64, ct;
+                                    ZZon_pp::Union{Nothing,AbstractVector}=nothing,
+                                    fcrit_pp::Union{Nothing,AbstractVector}=nothing)
+    npeaks = length(peaks)
+    RTHL      = fill(-1.0f0, npeaks)
+    Fbarx     = zeros(Float32, npeaks)
+    e_v       = zeros(Float32, npeaks)
+    p_v       = zeros(Float32, npeaks)
+    Srb       = zeros(Float32, npeaks)
+    d2F       = zeros(Float32, npeaks)
+    zvir_half = fill(-1.0f0, npeaks)
+    Sbar      = zeros(Float32, 3, npeaks)
+    Sbar2     = zeros(Float32, 3, npeaks)
+    gradpk    = zeros(Float32, 3, npeaks)
+    gradpkf   = zeros(Float32, 3, npeaks)
+    gradpkrf  = zeros(Float32, 3, npeaks)
+    strain_f  = zeros(Float32, 3, 3, npeaks)
+
+    fn_gpu_multi = getglobal(_pp_parent(), :analyse_peaks_gpu_cuda_multirf)
+    # Group peaks by Rf; batch order does not matter since the mask side-effect
+    # accumulates idempotently.
+    unique_Rfs = unique(Rf_per_peak)
+    batch_idxs = Vector{Vector{Int}}()
+    batches = Any[]
+    # Per-peak ZZon / fcrit (ievol==1) are sliced per batch; when `nothing`,
+    # the GPU entry point broadcasts the scalar ZZon and its fcrit.
+    have_pp = ZZon_pp !== nothing && fcrit_pp !== nothing
+    if have_pp
+        @assert length(ZZon_pp)  == npeaks "ZZon_pp  length $(length(ZZon_pp)) != npeaks $npeaks"
+        @assert length(fcrit_pp) == npeaks "fcrit_pp length $(length(fcrit_pp)) != npeaks $npeaks"
+    end
+    for Rf in unique_Rfs
+        idxs = findall(==(Rf), Rf_per_peak)
+        isempty(idxs) && continue
+        ir2min = min(floor(Int, (1.75 * Rf / alatt)^2),
+                     floor(Int, (40.0 / alatt - 1)^2))
+        pi_b = Int32[peaks[i].i for i in idxs]
+        pj_b = Int32[peaks[i].j for i in idxs]
+        pk_b = Int32[peaks[i].k for i in idxs]
+        if have_pp
+            zz_b = Float32[ZZon_pp[i]  for i in idxs]
+            fc_b = Float32[fcrit_pp[i] for i in idxs]
+            push!(batches, (pi_b, pj_b, pk_b, Rf, ir2min, zz_b, fc_b))
+        else
+            push!(batches, (pi_b, pj_b, pk_b, Rf, ir2min))
+        end
+        push!(batch_idxs, idxs)
+    end
+
+    if isempty(batches)
+        return (RTHL=RTHL, Fbarx=Fbarx, e_v=e_v, p_v=p_v, Srb=Srb, d2F=d2F,
+                 zvir_half=zvir_half, Sbar=Sbar, Sbar2=Sbar2,
+                 gradpk=gradpk, gradpkf=gradpkf, gradpkrf=gradpkrf,
+                 strain_final=strain_f)
+    end
+
+    # psi2_* is nothing when ilpt=1; substitute zeros in delta_tile's memory
+    # space (host or device) to avoid mixing Array and CuArray.
+    _zeros_like(t) = (x = similar(t); fill!(x, 0); x)
+    z_arr  = psi2_x === nothing ? _zeros_like(delta_tile) : psi2_x
+    z_arr2 = psi2_y === nothing ? _zeros_like(delta_tile) : psi2_y
+    z_arr3 = psi2_z === nothing ? _zeros_like(delta_tile) : psi2_z
+
+    batch_res = fn_gpu_multi(
+        delta_tile, psi_x, psi_y, psi_z, z_arr, z_arr2, z_arr3,
+        batches, stab_gpu, ct_table_gpu,
+        ct_params.X1, ct_params.X2,
+        ct_params.Y1, ct_params.Y2,
+        ct_params.Z1, ct_params.Z2,
+        alatt, ZZon;
+        ct=ct, rmax2rs=rmax2rs,
+        lapd=lapd_tile, mask=mask, nbuff=nbuff)
+
+    for (bi, idxs) in enumerate(batch_idxs)
+        res = batch_res.results[bi]
+        for (b, idx) in enumerate(idxs)
+            RTHL[idx]      = res.RTHL[b]
+            Fbarx[idx]     = res.Fbarx[b]
+            e_v[idx]       = res.e_v[b]
+            p_v[idx]       = res.p_v[b]
+            Srb[idx]       = res.Srb[b]
+            d2F[idx]       = res.d2F[b]
+            zvir_half[idx] = res.zvir_half[b]
+            for L in 1:3
+                Sbar[L, idx]     = res.Sbar[L, b]
+                Sbar2[L, idx]    = res.Sbar2[L, b]
+                gradpk[L, idx]   = res.gradpk[L, b]
+                gradpkf[L, idx]  = res.gradpkf[L, b]
+                gradpkrf[L, idx] = res.gradpkrf[L, b]
+                for K in 1:3
+                    strain_f[L, K, idx] = res.strain_final[L, K, b]
+                end
+            end
+        end
+    end
+    if batch_res.mask !== nothing
+        copyto!(mask, batch_res.mask)
+    end
+
+    return (RTHL=RTHL, Fbarx=Fbarx, e_v=e_v, p_v=p_v, Srb=Srb, d2F=d2F,
+             zvir_half=zvir_half, Sbar=Sbar, Sbar2=Sbar2,
+             gradpk=gradpk, gradpkf=gradpkf, gradpkrf=gradpkrf,
+             strain_final=strain_f)
+end
+
+"""
+Warn when a lightcone observer sits outside the region covered by tile cores. With
+`periodic_cores=false` the cores span ±ntile·nsub·a/2 while the periodic
+box is 2nbuff cells wider, so a box-corner observer sees an unsimulated slab of
+thickness (|obs| − ntile·nsub·a/2) next to each octant plane.
+"""
+function _warn_if_observer_outside_cores(cfg::PipelineConfig, ntile, nsub, nmesh)
+    cfg.ievol == 1 || return nothing
+    alatt = cfg.boxsize / nmesh
+    H = ntile * nsub * alatt / 2
+    gap = maximum(abs.((cfg.cenx, cfg.ceny, cfg.cenz))) - H
+    if gap > 0.01 * alatt                        # ignore config rounding (≪ one cell)
+        @warn "lightcone observer lies $(round(gap; digits=2)) Mpc/h outside the tile-core " *
+              "region (±$(round(H; digits=1)) Mpc/h): that slab next to each octant plane is " *
+              "never simulated. Set [grid] periodic_cores = true (N = nsub*ntile) for " *
+              "corner-observer lightcones." maxlog=1
+    end
+    nothing
+end
+
+"""
+    run_multitile_split(cfg; ntile, seed=42, verbose=false, coarse_factor=0, coarse_grid=0,
+                        use_gpu=false, devices=nothing, profile=false) -> Vector{HaloRecord/ExtHaloRecord}
+
+Multi-resolution variant of `run_multitile` following the MUSIC approach
+(Hahn & Abel 2011). Splits the convolution T*ξ into:
+
+- **δ_coarse**: Long-wavelength contribution computed on a coarse M³ grid
+  from block-averaged fine-grid noise. Periodic FFT over the entire box.
+
+- **δ_self**: Short-wavelength contribution computed per tile from the
+  residual noise ξ₁ = ξ − spread(block mean of ξ). Isolated FFT (2× zero-padded),
+  so no wrap-around.
+
+ξ₁ has zero mean in each coarse cell (Hoffman-Ribak constraint), so T*ξ₁ is
+dominated by short-wavelength modes that decay quickly in real space, making
+the isolated FFT accurate on a tile-sized domain. With `cfg.gaussian_split`
+the long/short handoff instead uses a Gaussian filter of scale r_s.
+
+Coarse grid size M: `coarse_grid` if > 0, else `ntile * coarse_factor` if > 0, else
+chosen automatically. M must divide N.
+
+`use_gpu=true` runs the per-tile FFTs, peak finding and shell analysis through the
+CUDA extension (requires CUDA.jl). `devices=[d0, d1, ...]` distributes tiles across
+those CUDA devices, one task per device; launch Julia with `--threads >= length(devices)`
+and without `CUDA_VISIBLE_DEVICES` masking them. `profile=true` logs per-stage timings.
+
+Memory per tile is O(nmesh³) instead of O(N³); no distributed FFT is needed.
+"""
+function run_multitile_split(cfg::PipelineConfig; ntile::Int, seed::Integer=42,
+                              verbose::Bool=false, coarse_factor::Int=0,
+                              coarse_grid::Int=0, use_gpu::Bool=false,
+                              devices::Union{Nothing,AbstractVector{Int}}=nothing,
+                              profile::Bool=false)
+    if use_gpu
+        haskey(ENV, "CUDA_VISIBLE_DEVICES") ||
+            @info "run_multitile_split(use_gpu=true): CUDA_VISIBLE_DEVICES not set; using default GPU"
+        isdefined(_pp_parent(), :isolated_convolve_gpu) || error("use_gpu=true requires CUDA.jl to be loaded (ext/CUDAExt.jl)")
+    end
+    if devices !== nothing && !isempty(devices)
+        use_gpu || error("devices=$devices requires use_gpu=true")
+        length(devices) > Threads.nthreads() &&
+            @warn "devices=$devices length > Threads.nthreads()=$(Threads.nthreads()); workers will share threads and may not run concurrently"
+    end
+    n_workers = (use_gpu && devices !== nothing && length(devices) >= 1) ? length(devices) : 1
+    nmesh = cfg.n
+    nbuff = cfg.nbuff
+    nsub, N = grid_layout(cfg, ntile)
+    _warn_if_observer_outside_cores(cfg, ntile, nsub, nmesh)
+    alatt = cfg.boxsize / nmesh
+    boxsize_full = N * alatt
+    dcore_box = nsub * alatt
+
+    Om_total = cfg.Omx + cfg.OmB
+    cosmo = CosmologyParams(Om_total, cfg.OmB, cfg.Omvac, cfg.h, 0.965, 0.808)
+    growth_tables = Dlinear_tables(cosmo)
+    ct_array, ct_params = read_homeltab(cfg.tabfile)
+    ct = CollapseTableInterp(ct_array, ct_params)
+    filters = read_filterbank(cfg.filterfile)
+    sort!(filters; by=f -> -f[3])
+    z_out = cfg.z_out
+    a_out = 1.0 / (1.0 + z_out)
+    ZZon = 1.0 + z_out
+    fcrit = Float32(fsc_of_z(z_out, ct))
+    _, _, D_out = Dlinear_ab(a_out, growth_tables)
+    Rfclmax = filters[1][3]
+    nhunt = min(nbuff - 1, floor(Int, Rfclmax * 1.75 / alatt))
+    shells = precompute_shells(nhunt)
+    Omnr = cosmo.Om
+    ioutshear = cfg.ioutshear
+    wsmooth = cfg.wsmooth
+    ilpt = cfg.ilpt
+    pk = load_pk(cfg.pkfile)
+
+    ievol = cfg.ievol
+    obs = (cfg.cenx, cfg.ceny, cfg.cenz)
+    z_max = cfg.z_max
+    chi2z = ievol == 1 ? build_chi_to_z(cosmo; z_max=z_max + 1.0) : nothing
+
+    # GPU shell-analysis tables, built once and uploaded per call by CUDAExt.
+    use_gpu_shell = use_gpu
+    stab_gpu = use_gpu_shell ? build_shell_tables(nhunt) : nothing
+    ct_table_gpu = use_gpu_shell ? Float32.(ct_array) : nothing
+
+    # ---- Coarse grid size M (must divide N) ----
+    # For the splice, block = N/M ≈ nmesh/3 to nmesh/2 gives the best halo counts.
+    if coarse_grid > 0
+        M = coarse_grid
+    elseif coarse_factor > 0
+        M = ntile * coarse_factor
+    else
+        # gaussian_split needs block ≤ nbuff (see _gaussian_split_rs); the splice prefers ~nmesh/3
+        target_block = cfg.gaussian_split ? clamp(nbuff ÷ 2, 2, nbuff) : nmesh ÷ 3
+        best_M = 0; best_dist = N
+        for m in 2:N÷2
+            N % m == 0 || continue
+            dist = abs(N ÷ m - target_block)
+            if dist < best_dist
+                best_dist = dist; best_M = m
+            end
+        end
+        M = best_M
+    end
+    @assert N % M == 0 "N=$N must be divisible by M=$M"
+    block = N ÷ M
+
+    verbose && @info "Phase 0: N=$N, ntile=$ntile, M_coarse=$M, block=$block"
+
+    # ---- Coarse-grid fields (global) ----
+    coarse_noise = _downsample_noise(N, M, seed)
+    coarse_k = rfft(coarse_noise)
+
+    # Splice compensation applies to every coarse field interpolated into the tiles
+    comp = cfg.coarse_compensation ? _splice_compensation(M, block) : nothing
+    verbose && comp !== nothing && @info "coarse splice compensation D/T on" block
+
+    delta_coarse_k = copy(coarse_k)
+    _periodic_convolve!(delta_coarse_k, pk, M, boxsize_full; comp=comp)
+    delta_coarse = irfft(delta_coarse_k, M)
+
+    psi_coarse = Vector{Array{Float32,3}}(undef, 3)
+    for dim in 1:3
+        psi_k = copy(coarse_k)
+        _periodic_convolve!(psi_k, pk, M, boxsize_full; kernel_fn=_kernel_1lpt(dim), comp=comp)
+        psi_coarse[dim] = irfft(psi_k, M)
+    end
+
+    # Coarse 2LPT: src2 = ½δ² − ½Σφ_ii² − Σ_{i<j}φ_ij², then displacement
+    psi2_coarse = nothing
+    if ilpt >= 2
+        src2 = zeros(Float32, M, M, M)
+        src2 .+= delta_coarse .^ 2 .* 0.5f0
+        for d in 1:3
+            phi_k = copy(coarse_k)
+            _periodic_convolve!(phi_k, pk, M, boxsize_full; kernel_fn=_kernel_phi_ij(d, d))
+            phi_r = irfft(phi_k, M)
+            src2 .-= phi_r .^ 2 .* 0.5f0
+        end
+        for (di, dj) in ((1,2), (1,3), (2,3))
+            phi_k = copy(coarse_k)
+            _periodic_convolve!(phi_k, pk, M, boxsize_full; kernel_fn=_kernel_phi_ij(di, dj))
+            phi_r = irfft(phi_k, M)
+            src2 .-= phi_r .^ 2
+        end
+        src2_k = rfft(src2)
+        psi2_coarse = Vector{Array{Float32,3}}(undef, 3)
+        for dim in 1:3
+            psi2_k = copy(src2_k)
+            _periodic_convolve!(psi2_k, pk, M, boxsize_full; kernel_fn=_kernel_2lpt(dim))
+            psi2_coarse[dim] = irfft(psi2_k, M)
+        end
+    end
+
+    # gaussian_split: Gaussian long/short handoff (see _gsplit_setup / _gsplit_tile)
+    gsplit = cfg.gaussian_split
+    gs = nothing
+    if gsplit
+        rs_cells = _gaussian_split_rs(cfg.gaussian_split_rs, block, nbuff)
+        gs = _gsplit_setup(coarse_noise, pk, M, boxsize_full, comp, rs_cells, alatt)
+        verbose && @info "gaussian_split: long/short handoff" rs_cells block
+    end
+
+    lapd_coarse = nothing
+    if ioutshear >= 1
+        lapd_k = copy(coarse_k)
+        _periodic_convolve!(lapd_k, pk, M, boxsize_full; kernel_fn=_kernel_laplacian(), comp=comp)
+        lapd_coarse = irfft(lapd_k, M)
+    end
+
+    # coarse_noise (not coarse_k) is still needed for the per-tile residual
+    coarse_k = nothing
+
+    verbose && @info "Phase 1a: coarse fields done (M=$M)"
+
+    # ---- Tile list (lightcone: drop tiles beyond chi(z_max)) ----
+    tile_ids = NTuple{3,Int}[]
+    for kt in 1:ntile, jt in 1:ntile, it in 1:ntile
+        push!(tile_ids, (it, jt, kt))
+    end
+    if ievol == 1
+        chi_max = chi(z_max, cosmo)
+        half = dcore_box / 2.0
+        filter!(tile_ids) do tid
+            it, jt, kt = tid
+            xbx, ybx, zbx = tile_center(it, jt, kt, ntile, dcore_box)
+            dx = max(abs(xbx - obs[1]) - half, 0.0)
+            dy = max(abs(ybx - obs[2]) - half, 0.0)
+            dz = max(abs(zbx - obs[3]) - half, 0.0)
+            sqrt(dx^2 + dy^2 + dz^2) <= chi_max
+        end
+    end
+
+    # Per-worker halo accumulators, so concurrent workers never share a vector.
+    local_halos_basic = [HaloRecord[] for _ in 1:n_workers]
+    local_halos_ext   = [ExtHaloRecord[] for _ in 1:n_workers]
+
+    _new_timing_dict() = Dict{String,Float64}(
+        "01_residual_gen" => 0.0,
+        "02_iso_fft_delta" => 0.0,
+        "03_interp_coarse_delta" => 0.0,
+        "03_gaussian_split" => 0.0,
+        "04_iso_fft_psi1" => 0.0,
+        "05_interp_coarse_psi1" => 0.0,
+        "06_2lpt_periodic_fft" => 0.0,
+        "07_laplacian_periodic_fft" => 0.0,
+        "08_peak_find" => 0.0,
+        "09_shell_analysis" => 0.0,
+        "10_record_packing" => 0.0,
+    )
+    local_timings = [_new_timing_dict() for _ in 1:n_workers]
+
+    boxsize_local = nmesh * alatt
+
+    # Per-tile work. Reads only shared read-only state and writes only to the
+    # accumulators passed in, so workers may call it concurrently.
+    process_tile! = function (wid::Int, ti::Int, tid::NTuple{3,Int},
+                              halos_basic::Vector{HaloRecord},
+                              halos_ext::Vector{ExtHaloRecord},
+                              timings::Dict{String,Float64})
+        it, jt, kt = tid
+        _tic()  = profile ? time() : 0.0
+        _toc!(key::String, t0::Float64) = profile ? (timings[key] = get(timings, key, 0.0) + time() - t0) : nothing
+
+        # ---- Tile-local fields (MUSIC decomposition) ----
+        t0 = _tic()
+        residual = _generate_extended_residual(it, jt, kt, nsub, nmesh, N, seed,
+                                                coarse_noise, M, 0)
+        _toc!("01_residual_gen", t0)
+
+        # δ_self and ψ₁_self by isolated FFT of the residual. The GPU path shares one
+        # upload + rfft across all kernels and keeps the results on the device.
+        delta_self = nothing
+        psi_self_arr = Vector{Any}(undef, 3)
+        if use_gpu
+            t0 = _tic()
+            fn_multi = getglobal(_pp_parent(), :isolated_convolve_gpu_multi)
+            outs = fn_multi(residual, pk, boxsize_local, nmesh;
+                             kernels=gsplit ? [(0, 0, 0)] : [(0, 0, 0), (1, 1, 0), (1, 2, 0), (1, 3, 0)],
+                             nshell=0, return_device=true)
+            delta_self = outs[1]
+            if !gsplit
+                psi_self_arr[1] = outs[2]
+                psi_self_arr[2] = outs[3]
+                psi_self_arr[3] = outs[4]
+            end
+            _toc!("02_iso_fft_delta", t0)
+        else
+            t0 = _tic()
+            delta_self = _isolated_convolve_dispatch(false, residual, pk,
+                                                      boxsize_local, nmesh, 0, 0, 0)
+            _toc!("02_iso_fft_delta", t0)
+            gsplit || for dim in 1:3
+                t0p = _tic()
+                psi_self_arr[dim] = _isolated_convolve_dispatch(false, residual, pk,
+                                                                  boxsize_local, nmesh, 1, dim, 0)
+                _toc!("04_iso_fft_psi1", t0p)
+            end
+        end
+
+        psi_tile = Vector{Any}(undef, 3)
+        if gsplit
+            t0 = _tic()
+            delta_tile, psi_g, _ = _gsplit_tile(gs, use_gpu, delta_self, coarse_noise, it, jt, kt,
+                                                nsub, nmesh, N, M, boxsize_local)
+            for dim in 1:3
+                psi_tile[dim] = psi_g[dim]
+            end
+            psi_g = nothing; delta_self = nothing
+            _toc!("03_gaussian_split", t0)
+        else
+        t0 = _tic()
+        delta_long = if use_gpu
+            fn = getglobal(_pp_parent(), :interpolate_to_tile_gpu)
+            fn(delta_coarse, it, jt, kt, nsub, nmesh, N, M; return_device=true)
+        else
+            _interpolate_to_tile(delta_coarse, it, jt, kt, nsub, nmesh, N, M)
+        end
+        _toc!("03_interp_coarse_delta", t0)
+
+        delta_tile = delta_self .+ delta_long
+        delta_self = nothing; delta_long = nothing
+
+        for dim in 1:3
+            t0 = _tic()
+            psi_long = if use_gpu
+                fn = getglobal(_pp_parent(), :interpolate_to_tile_gpu)
+                fn(psi_coarse[dim], it, jt, kt, nsub, nmesh, N, M; return_device=true)
+            else
+                _interpolate_to_tile(psi_coarse[dim], it, jt, kt, nsub, nmesh, N, M)
+            end
+            _toc!("05_interp_coarse_psi1", t0)
+            psi_tile[dim] = psi_self_arr[dim] .+ psi_long
+            psi_self_arr[dim] = nothing
+        end
+        end
+
+        residual = nothing
+
+        # 2LPT and Laplacian are computed from the combined δ on the periodic tile grid.
+        psi2_tile = nothing
+        if ilpt >= 2
+            t0 = _tic()
+            if use_gpu
+                fn = getglobal(_pp_parent(), :compute_2lpt_gpu)
+                psi2_tile = fn(delta_tile, nmesh, boxsize_local; return_device=true)
+            else
+                delta_tile_k = rfft(delta_tile)
+                src2_local = zeros(Float32, nmesh, nmesh, nmesh)
+                src2_local .+= delta_tile .^ 2 .* 0.5f0
+                for d in 1:3
+                    phi_k = copy(delta_tile_k)
+                    _apply_kernel_inplace!(phi_k, nmesh, boxsize_local, _kernel_phi_ij(d, d); zero_nyquist=false)
+                    src2_local .-= irfft(phi_k, nmesh) .^ 2 .* 0.5f0
+                end
+                for (di, dj) in ((1,2), (1,3), (2,3))
+                    phi_k = copy(delta_tile_k)
+                    _apply_kernel_inplace!(phi_k, nmesh, boxsize_local, _kernel_phi_ij(di, dj); zero_nyquist=false)
+                    src2_local .-= irfft(phi_k, nmesh) .^ 2
+                end
+                src2_local_k = rfft(src2_local)
+                psi2_tile = Vector{Array{Float32,3}}(undef, 3)
+                for dim in 1:3
+                    psi2_k = copy(src2_local_k)
+                    _apply_kernel_inplace!(psi2_k, nmesh, boxsize_local, _kernel_2lpt(dim))
+                    psi2_tile[dim] = irfft(psi2_k, nmesh)
+                end
+                delta_tile_k = nothing; src2_local_k = nothing
+            end
+            _toc!("06_2lpt_periodic_fft", t0)
+        end
+
+        lapd_tile = nothing
+        if ioutshear >= 1
+            t0 = _tic()
+            if use_gpu
+                fn = getglobal(_pp_parent(), :compute_laplacian_gpu)
+                lapd_tile = fn(delta_tile, nmesh, boxsize_local; return_device=true)
+            else
+                delta_tile_k_tmp = rfft(delta_tile)
+                _apply_kernel_inplace!(delta_tile_k_tmp, nmesh, boxsize_local, _kernel_laplacian())
+                lapd_tile = irfft(delta_tile_k_tmp, nmesh)
+                delta_tile_k_tmp = nothing
+            end
+            _toc!("07_laplacian_periodic_fft", t0)
+        end
+
+        # CPU FFT temporaries pile up; GPU buffers are already released with unsafe_free!.
+        use_gpu || GC.gc()
+
+        # ---- Peak finding ----
+        t0 = _tic()
+        tile_masks  = zeros(Int8, nmesh, nmesh, nmesh)
+        tile_peaks  = PeakCandidate[]
+        tile_Rf     = Float64[]
+        tile_FcRf   = Float32[]
+        tile_d2Rf   = Float32[]
+
+        xbx, ybx, zbx = tile_center(it, jt, kt, ntile, dcore_box)
+        # Peak threshold: constant fsc_of_z(z_out) by default. Fortran hpkvd uses
+        # fsc_of_z(z_tile) from the tile centre's distance on the lightcone (hpkvd.f90:510-514,
+        # peakvoidsubs.f90:82); opt in with cfg.peak_threshold_per_tile. Per-peak redshift
+        # enters shell analysis either way.
+        fcrits_per_filter = Vector{Float32}(undef, length(filters))
+        if ievol == 1 && cfg.peak_threshold_per_tile
+            r_tile = sqrt((xbx - obs[1])^2 + (ybx - obs[2])^2 + (zbx - obs[3])^2)
+            fill!(fcrits_per_filter, Float32(fsc_of_z(chi_to_z(chi2z, r_tile), ct)))
+        else
+            fill!(fcrits_per_filter, fcrit)
+        end
+
+        if use_gpu
+            fn = getglobal(_pp_parent(), :peak_find_tile_gpu)
+            pf = fn(delta_tile, filters, fcrits_per_filter, tile_masks,
+                    xbx, ybx, zbx, alatt, nbuff, wsmooth, ioutshear)
+            tile_peaks = pf.peaks
+            tile_Rf    = pf.Rf
+            tile_FcRf  = pf.FcRf
+            tile_d2Rf  = pf.d2Rf
+            copyto!(tile_masks, pf.mask)
+        else
+            delta_tile_k = rfft(delta_tile)
+            for ic in 1:length(filters)
+                Rf = filters[ic][3]
+                delta_s = smooth_field(delta_tile_k, nmesh, boxsize_local, Rf, wsmooth)
+
+                new_peaks = find_peaks(delta_s, tile_masks, xbx, ybx, zbx,
+                                        alatt, nbuff, fcrits_per_filter[ic], Rf)
+                append!(tile_peaks, new_peaks)
+                append!(tile_Rf, fill(Rf, length(new_peaks)))
+
+                if !isempty(new_peaks)
+                    lapd_s = ioutshear >= 1 ?
+                        smooth_field(delta_tile_k, nmesh, boxsize_local, Rf, 3) : nothing
+                    for pk_cand in new_peaks
+                        i, j, k = pk_cand.i, pk_cand.j, pk_cand.k
+                        push!(tile_FcRf, delta_s[i, j, k])
+                        push!(tile_d2Rf, lapd_s !== nothing ? lapd_s[i, j, k] : 0.0f0)
+                    end
+                end
+            end
+            delta_tile_k = nothing
+        end
+        _toc!("08_peak_find", t0)
+
+        # ---- Shell analysis ----
+        if isempty(tile_peaks)
+            if use_gpu
+                # Release device-resident tile fields early
+                delta_tile = nothing
+                for d in 1:3; psi_tile[d] = nothing; end
+                psi_tile = nothing
+                psi2_tile = nothing
+                lapd_tile = nothing
+            end
+            return nothing
+        end
+
+        fill!(tile_masks, 0)
+        # PeakGrid (CPU only) does not support device arrays
+        pg = use_gpu_shell ? nothing :
+             PeakGrid(delta_tile,
+                      psi_tile[1], psi_tile[2], psi_tile[3],
+                      psi2_tile !== nothing ? psi2_tile[1] : nothing,
+                      psi2_tile !== nothing ? psi2_tile[2] : nothing,
+                      psi2_tile !== nothing ? psi2_tile[3] : nothing,
+                      tile_masks, (nmesh, nmesh, nmesh),
+                      lapd_tile)
+
+        gpu_res = nothing
+        if use_gpu_shell
+            t0 = _tic()
+            # Lightcone: per-peak ZZon and fcrit from the observer distance. Peaks with
+            # z_pk > z_max are dropped before the kernel, matching the CPU path where they
+            # never reach analyse_peak (so the mask side-effect is the same).
+            ZZon_pp_tile  = nothing
+            fcrit_pp_tile = nothing
+            if ievol == 1
+                npk0 = length(tile_peaks)
+                z_pk_tile      = Vector{Float64}(undef, npk0)
+                ZZon_pp_full   = Vector{Float32}(undef, npk0)
+                fcrit_pp_full  = Vector{Float32}(undef, npk0)
+                @inbounds for idx in 1:npk0
+                    p = tile_peaks[idx]
+                    z_pk = peak_redshift(obs[1], obs[2], obs[3], p.x, p.y, p.z, chi2z)
+                    z_pk_tile[idx]     = z_pk
+                    ZZon_pp_full[idx]  = Float32(1.0 + z_pk)
+                    fcrit_pp_full[idx] = Float32(fsc_of_z(z_pk, ct))
+                end
+                keep = findall(z -> z <= z_max, z_pk_tile)
+                if length(keep) < npk0
+                    tile_peaks    = tile_peaks[keep]
+                    tile_Rf       = tile_Rf[keep]
+                    tile_FcRf     = tile_FcRf[keep]
+                    tile_d2Rf     = tile_d2Rf[keep]
+                    ZZon_pp_tile  = ZZon_pp_full[keep]
+                    fcrit_pp_tile = fcrit_pp_full[keep]
+                else
+                    ZZon_pp_tile  = ZZon_pp_full
+                    fcrit_pp_tile = fcrit_pp_full
+                end
+                if isempty(tile_peaks)
+                    _toc!("09_shell_analysis", t0)
+                    return nothing
+                end
+            end
+            # ioutshear=0 has no lapd field; use zeros in delta_tile's memory space
+            lapd_for_shell = if lapd_tile !== nothing
+                lapd_tile
+            else
+                tmp = similar(delta_tile); fill!(tmp, 0); tmp
+            end
+            gpu_res = _gpu_analyse_peaks_batch(
+                delta_tile,
+                psi_tile[1], psi_tile[2], psi_tile[3],
+                psi2_tile !== nothing ? psi2_tile[1] : nothing,
+                psi2_tile !== nothing ? psi2_tile[2] : nothing,
+                psi2_tile !== nothing ? psi2_tile[3] : nothing,
+                lapd_for_shell,
+                tile_masks,
+                tile_peaks, tile_Rf,
+                stab_gpu, ct_table_gpu, ct_params,
+                alatt, ZZon, nbuff, cfg.rmax2rs, ct;
+                ZZon_pp=ZZon_pp_tile, fcrit_pp=fcrit_pp_tile)
+            _toc!("09_shell_analysis", t0)
+
+            # Drop device-resident fields so they can be freed before the next tile
+            delta_tile = nothing
+            for d in 1:3; psi_tile[d] = nothing; end
+            psi_tile = nothing
+            psi2_tile = nothing
+            lapd_tile = nothing
+        end
+
+        t_loop_start = _tic()
+        shell_cpu_time = 0.0
+        if use_gpu_shell
+            r = gpu_res
+            npks = length(tile_peaks)
+            coef2_base = -3.0/7.0          # 2LPT: coef = coef2_base * Om_a^(-1/143) * D_pk^2
+            @inbounds for idx in 1:npks
+                r.RTHL[idx] <= 0 && continue
+
+                peak = tile_peaks[idx]
+                ZZon_pk = ZZon
+                if ievol == 1
+                    z_pk = peak_redshift(obs[1], obs[2], obs[3], peak.x, peak.y, peak.z, chi2z)
+                    ZZon_pk = 1.0 + z_pk
+                    z_pk > z_max && continue
+                end
+
+                a_pk = 1.0 / ZZon_pk
+                D_pk, _, _ = Dlinear_ab(a_pk, growth_tables)   # first return value is D(a)
+                D_pk_f32 = Float32(D_pk)
+                RTHL_phys = Float32(Float64(r.RTHL[idx]) * alatt)
+
+                Sbar1 = r.Sbar[1, idx] * D_pk_f32
+                Sbar2 = r.Sbar[2, idx] * D_pk_f32
+                Sbar3 = r.Sbar[3, idx] * D_pk_f32
+
+                Sbar2_1 = 0.0f0; Sbar2_2 = 0.0f0; Sbar2_3 = 0.0f0
+                if ilpt >= 2
+                    Om_a = omega_m_a(Omnr, cosmo.OL, a_pk)
+                    coef = Float32(coef2_base * Om_a^(-1.0/143) * D_pk^2)   # -3/7 sign matches Fortran
+                    Sbar2_1 = r.Sbar2[1, idx] * coef
+                    Sbar2_2 = r.Sbar2[2, idx] * coef
+                    Sbar2_3 = r.Sbar2[3, idx] * coef
+                end
+
+                if ioutshear >= 1
+                    push!(halos_ext, ExtHaloRecord(
+                        Float32(peak.x), Float32(peak.y), Float32(peak.z),
+                        Sbar1, Sbar2, Sbar3,
+                        RTHL_phys,
+                        Sbar2_1, Sbar2_2, Sbar2_3,
+                        r.Fbarx[idx],
+                        r.e_v[idx], r.p_v[idx],
+                        r.strain_final[1,1,idx], r.strain_final[2,2,idx], r.strain_final[3,3,idx],
+                        r.strain_final[2,3,idx], r.strain_final[1,3,idx], r.strain_final[1,2,idx],
+                        r.d2F[idx], r.zvir_half[idx],
+                        r.gradpk[1,idx],  r.gradpk[2,idx],  r.gradpk[3,idx],
+                        r.gradpkf[1,idx], r.gradpkf[2,idx], r.gradpkf[3,idx],
+                        Float32(tile_Rf[idx]), tile_FcRf[idx], tile_d2Rf[idx],
+                        r.gradpkrf[1,idx], r.gradpkrf[2,idx], r.gradpkrf[3,idx],
+                    ))
+                else
+                    push!(halos_basic, HaloRecord(
+                        Float32(peak.x), Float32(peak.y), Float32(peak.z),
+                        Sbar1, Sbar2, Sbar3,
+                        RTHL_phys,
+                        Sbar2_1, Sbar2_2, Sbar2_3,
+                        r.Fbarx[idx],
+                    ))
+                end
+            end
+        else
+            for idx in 1:length(tile_peaks)
+                peak = tile_peaks[idx]
+                Rf = tile_Rf[idx]
+                ir2min = min(floor(Int, (1.75 * Rf / alatt)^2),
+                             floor(Int, (40.0 / alatt - 1)^2))
+
+                ZZon_pk = ZZon
+                if ievol == 1
+                    z_pk = peak_redshift(obs[1], obs[2], obs[3], peak.x, peak.y, peak.z, chi2z)
+                    ZZon_pk = 1.0 + z_pk
+                    z_pk > z_max && continue
+                end
+
+                result = if profile
+                    ts = time()
+                    r = analyse_peak(pg, peak.ipp, alatt, ir2min, ZZon_pk, Rf, ct, shells;
+                                      nbuff=nbuff, rmax2rs=cfg.rmax2rs)
+                    shell_cpu_time += time() - ts
+                    r
+                else
+                    analyse_peak(pg, peak.ipp, alatt, ir2min, ZZon_pk, Rf, ct, shells;
+                                  nbuff=nbuff, rmax2rs=cfg.rmax2rs)
+                end
+
+                result.RTHL <= 0 && continue
+
+                a_pk = 1.0 / ZZon_pk
+                D_pk, _, _ = Dlinear_ab(a_pk, growth_tables)   # first return value is D(a)
+                RTHL_phys = Float32(result.RTHL * alatt)
+                Sbar_vel = result.Sbar .* D_pk
+
+                Sbar2_vel = zeros(3)
+                if ilpt >= 2
+                    Om_a = omega_m_a(Omnr, cosmo.OL, a_pk)
+                    Sbar2_vel = result.Sbar2 .* (-3.0/7.0 * Om_a^(-1.0/143) * D_pk^2)   # -3/7 sign matches Fortran
+                end
+
+                if ioutshear >= 1
+                    sm = result.strain_mat
+                    push!(halos_ext, ExtHaloRecord(
+                        Float32(peak.x), Float32(peak.y), Float32(peak.z),
+                        Float32(Sbar_vel[1]), Float32(Sbar_vel[2]), Float32(Sbar_vel[3]),
+                        RTHL_phys,
+                        Float32(Sbar2_vel[1]), Float32(Sbar2_vel[2]), Float32(Sbar2_vel[3]),
+                        Float32(result.Fbarx),
+                        Float32(result.e_v), Float32(result.p_v),
+                        Float32(sm[1,1]), Float32(sm[2,2]), Float32(sm[3,3]),
+                        Float32(sm[2,3]), Float32(sm[1,3]), Float32(sm[1,2]),
+                        Float32(result.d2F), Float32(result.zvir_half),
+                        Float32(result.gradpk[1]), Float32(result.gradpk[2]), Float32(result.gradpk[3]),
+                        Float32(result.gradpkf[1]), Float32(result.gradpkf[2]), Float32(result.gradpkf[3]),
+                        Float32(Rf), tile_FcRf[idx], tile_d2Rf[idx],
+                        Float32(result.gradpkrf[1]), Float32(result.gradpkrf[2]), Float32(result.gradpkrf[3])
+                    ))
+                else
+                    push!(halos_basic, HaloRecord(
+                        Float32(peak.x), Float32(peak.y), Float32(peak.z),
+                        Float32(Sbar_vel[1]), Float32(Sbar_vel[2]), Float32(Sbar_vel[3]),
+                        RTHL_phys,
+                        Float32(Sbar2_vel[1]), Float32(Sbar2_vel[2]), Float32(Sbar2_vel[3]),
+                        Float32(result.Fbarx)
+                    ))
+                end
+            end
+        end
+        if profile
+            t_loop_total = time() - t_loop_start
+            # On the GPU path shell time is already in "09_shell_analysis"
+            if use_gpu_shell
+                timings["10_record_packing"] += t_loop_total
+            else
+                timings["09_shell_analysis"] += shell_cpu_time
+                timings["10_record_packing"] += t_loop_total - shell_cpu_time
+            end
+        end
+
+        n_halos = ioutshear >= 1 ? length(halos_ext) : length(halos_basic)
+        verbose && @info "  Tile $ti/$(length(tile_ids)) ($it,$jt,$kt) [w=$wid]: $(length(tile_peaks)) peaks, $n_halos worker-local halos"
+        return nothing
+    end
+
+    # ---- Dispatch: sequential or one task per GPU ----
+    if n_workers > 1
+        # Round-robin tiles across workers for load balance
+        wid_of = Int[mod1(i, n_workers) for i in 1:length(tile_ids)]
+        # Each task owns its output arrays: Julia 1.12 raises ConcurrencyViolationError
+        # when spawned tasks mutate parent-task arrays.
+        worker_results = Vector{Any}(undef, n_workers)
+        tasks = Task[]
+        for wid in 1:n_workers
+            my_indices = [i for i in 1:length(tile_ids) if wid_of[i] == wid]
+            my_device  = devices[wid]
+            t = Threads.@spawn begin
+                set_dev = getglobal(_pp_parent(), :set_cuda_device!)
+                set_dev(my_device)
+                my_halos_basic = HaloRecord[]
+                my_halos_ext   = ExtHaloRecord[]
+                my_timings     = _new_timing_dict()
+                for idx in my_indices
+                    process_tile!(wid, idx, tile_ids[idx], my_halos_basic, my_halos_ext, my_timings)
+                end
+                worker_results[wid] = (my_halos_basic, my_halos_ext, my_timings)
+            end
+            push!(tasks, t)
+        end
+        foreach(wait, tasks)
+        for wid in 1:n_workers
+            local_halos_basic[wid] = worker_results[wid][1]
+            local_halos_ext[wid]   = worker_results[wid][2]
+            local_timings[wid]     = worker_results[wid][3]
+        end
+    else
+        for (ti, tid) in enumerate(tile_ids)
+            process_tile!(1, ti, tid, local_halos_basic[1], local_halos_ext[1], local_timings[1])
+        end
+    end
+
+    # Halo order is not deterministic across workers; pksc has no ordering requirement.
+    halos_basic = reduce(vcat, local_halos_basic; init=HaloRecord[])
+    halos_ext   = reduce(vcat, local_halos_ext;   init=ExtHaloRecord[])
+
+    if profile
+        # Max across workers approximates per-stage wall time; sum is total GPU-seconds.
+        keys_sorted = sort!(collect(keys(local_timings[1])))
+        agg_max = Dict(k => maximum(td[k] for td in local_timings) for k in keys_sorted)
+        agg_sum = Dict(k => sum(td[k] for td in local_timings)     for k in keys_sorted)
+        wall_proxy = sum(values(agg_max))
+        total_gpu_s = sum(values(agg_sum))
+        @info "run_multitile_split profile (use_gpu=$use_gpu, ntile=$ntile, nmesh=$(cfg.n), n_workers=$n_workers)"
+        for key in keys_sorted
+            tmax = agg_max[key]; tsum = agg_sum[key]
+            pct = 100 * tmax / max(wall_proxy, 1e-9)
+            @info @sprintf("  %-28s  max/worker=%7.2f s  (%5.1f%%)   sum=%8.2f s",
+                           key, tmax, pct, tsum)
+        end
+        @info @sprintf("  %-28s  wall~max=%7.2f s  total-GPU-s=%8.2f s", "TOTAL_stages", wall_proxy, total_gpu_s)
+    end
+
+    halos = ioutshear >= 1 ? halos_ext : halos_basic
+    verbose && @info "Done: $(length(halos)) halos"
+    return halos
+end
+
+"""Apply a k-space kernel to an existing k-space array (no P(k), just the kernel)."""
+# φ_ij uses zero_nyquist=false: the tile 2LPT source uses the un-zeroed δ, so zeroing the
+# Nyquist planes in φ_ij would break the trace identity.
+function _apply_kernel_inplace!(arr_k, n::Int, boxsize::Float64, kernel_fn;
+                                zero_nyquist::Bool=true)
+    dk = 2π / boxsize
+    kx_arr = Float64.(FFTW.rfftfreq(n, n * dk))
+    ky_arr = Float64.(FFTW.fftfreq(n, n * dk))
+    kz_arr = Float64.(FFTW.fftfreq(n, n * dk))
+    nyq = n ÷ 2; nk = n ÷ 2 + 1
+
+    for iz in 1:n, iy in 1:n, ix in 1:nk
+        kx = kx_arr[ix]; ky = ky_arr[iy]; kz = kz_arr[iz]
+        k2 = kx^2 + ky^2 + kz^2
+        if k2 == 0.0 || (zero_nyquist && (ix == nk || iy == nyq + 1 || iz == nyq + 1))
+            arr_k[ix, iy, iz] = 0
+            continue
+        end
+        arr_k[ix, iy, iz] *= kernel_fn(kx, ky, kz, k2)
+    end
+end
+
+"""
+    compare_fields_split(pk, N, boxsize, seed, ntile, coarse_factor; verbose=false)
+
+Generate delta and 1LPT displacement fields using both global FFT and the
+multi-resolution split, then return per-tile comparison metrics.
+
+Returns a vector of NamedTuples with fields:
+  tile, corr_delta, rms_delta, corr_psi1, rms_psi1, std_global_delta
+"""
+function compare_fields_split(pk, N::Int, boxsize::Float64, seed::Int,
+                               ntile::Int, coarse_factor::Int;
+                               nbuff::Int=8, coarse_grid::Int=0, verbose::Bool=false)
+    nsub = (N - 2 * nbuff) ÷ ntile
+    nmesh = nsub + 2 * nbuff
+    @assert nsub * ntile + 2 * nbuff == N "N=$N not consistent with ntile=$ntile, nbuff=$nbuff"
+
+    M = coarse_grid > 0 ? coarse_grid : ntile * coarse_factor
+    @assert N % M == 0 "N=$N must be divisible by M=$M"
+    block = N ÷ M
+    alatt = boxsize / N
+
+    verbose && @info "compare_fields_split: N=$N, ntile=$ntile, nmesh=$nmesh, nsub=$nsub, M=$M, block=$block"
+
+    # ---- Global FFT reference ----
+    delta_global = generate_grf(N, pk, boxsize, seed)
+    delta_k_global = rfft(delta_global)
+    psi_global = displacements_1lpt(delta_k_global, N, boxsize)
+
+    # ---- Multi-resolution split ----
+    coarse_noise = _downsample_noise(N, M, seed)
+    coarse_k = rfft(coarse_noise)
+
+    delta_coarse_k = copy(coarse_k)
+    _periodic_convolve!(delta_coarse_k, pk, M, boxsize)
+    delta_coarse = irfft(delta_coarse_k, M)
+
+    psi_coarse = Vector{Array{Float32,3}}(undef, 3)
+    for dim in 1:3
+        psi_k = copy(coarse_k)
+        _periodic_convolve!(psi_k, pk, M, boxsize; kernel_fn=_kernel_1lpt(dim))
+        psi_coarse[dim] = irfft(psi_k, M)
+    end
+
+    boxsize_tile = nmesh * alatt
+
+    results = NamedTuple[]
+
+    for kt in 1:ntile, jt in 1:ntile, it in 1:ntile
+        # Global reference on the tile core only
+        ig0 = (it - 1) * nsub + 1
+        jg0 = (jt - 1) * nsub + 1
+        kg0 = (kt - 1) * nsub + 1
+        ref_delta_core = delta_global[ig0:ig0+nsub-1, jg0:jg0+nsub-1, kg0:kg0+nsub-1]
+        ref_psi1_core  = psi_global[1][ig0:ig0+nsub-1, jg0:jg0+nsub-1, kg0:kg0+nsub-1]
+
+        residual = _generate_extended_residual(it, jt, kt, nsub, nmesh, N, seed,
+                                                coarse_noise, M, 0)
+
+        delta_self = _isolated_convolve(residual, pk, boxsize_tile, nmesh)
+        delta_long = _interpolate_to_tile(delta_coarse, it, jt, kt, nsub, nmesh, N, M)
+        delta_split = delta_self .+ delta_long
+
+        psi1_self = _isolated_convolve(residual, pk, boxsize_tile, nmesh;
+                                        kernel_fn=_kernel_1lpt(1))
+        psi1_long = _interpolate_to_tile(psi_coarse[1], it, jt, kt, nsub, nmesh, N, M)
+        psi1_split = psi1_self .+ psi1_long
+
+        core = (nbuff+1):(nbuff+nsub)
+        d_ref = Float64.(ref_delta_core)
+        d_spl = Float64.(delta_split[core, core, core])
+        p_ref = Float64.(ref_psi1_core)
+        p_spl = Float64.(psi1_split[core, core, core])
+
+        corr_d = _correlation(d_ref, d_spl)
+        rms_d  = _rms_frac(d_ref, d_spl)
+        corr_p = _correlation(p_ref, p_spl)
+        rms_p  = _rms_frac(p_ref, p_spl)
+        std_d  = sqrt(sum(d_ref .^ 2) / length(d_ref))
+
+        push!(results, (tile=(it,jt,kt), corr_delta=corr_d, rms_delta=rms_d,
+                         corr_psi1=corr_p, rms_psi1=rms_p, std_global_delta=std_d))
+
+        verbose && @info "  Tile ($it,$jt,$kt): corr_δ=$(round(corr_d; digits=6)), " *
+                         "rms_δ=$(round(rms_d*100; digits=2))%, " *
+                         "corr_ψ₁=$(round(corr_p; digits=6)), " *
+                         "rms_ψ₁=$(round(rms_p*100; digits=2))%"
+    end
+
+    return results
+end
+
+function _correlation(a, b)
+    ma = sum(a) / length(a); mb = sum(b) / length(b)
+    da = a .- ma; db = b .- mb
+    return sum(da .* db) / sqrt(sum(da .^ 2) * sum(db .^ 2))
+end
+
+function _rms_frac(a, b)
+    diff = a .- b
+    rms_diff = sqrt(sum(diff .^ 2) / length(diff))
+    rms_a = sqrt(sum(a .^ 2) / length(a))
+    return rms_a > 0 ? rms_diff / rms_a : 0.0
+end
+
+include("FieldMap.jl")
+
+end # module MultiResolution
