@@ -128,3 +128,47 @@ end
     @test vec(d2 .- d1) ≈ -0.4 * (rd^2 - 1) .* vec(P) rtol=1e-8
     @test vec(v2 .- v1) ≈ 2 * -0.4 * (rd * rv - 1) .* vec(P) rtol=1e-8
 end
+
+@testset "Screening" begin
+    MG = Huntian.ModifiedGravity
+    c = CosmologyParams(0.281, 0.046, 0.719, 0.697, 0.971, 0.82)
+
+    # A body feeling the field's μ follows the field
+    m = HuSawicki(fR0=1e-5)
+    D, dD, Db, dDb = MG._solve_growth_body(a -> mu(m, 1.0, a, c), a -> mu(m, 1.0, a, c), [0.5, 1.0], c)
+    @test Db ≈ D rtol=1e-12
+    @test dDb ≈ dD rtol=1e-12
+
+    t = mg_growth_table(m, c; nk=41, na=19)
+    @test growth_ratio(t, 1e-4, 1.0; screened=true) ≈ 1 atol=1e-4
+    @test 1 < velocity_ratio(t, 1.0, 1.0; screened=true) < velocity_ratio(t, 1.0, 1.0)   # falls in the MG field, feels no fifth force
+    @test 1 < growth_ratio(t, 1.0, 1.0; screened=true) < growth_ratio(t, 1.0, 1.0)
+    tg = mg_growth_table(GR(), c; nk=9, na=11)
+    @test all(tg.RD0 .≈ 1) && all(tg.Rv0 .≈ 1)
+
+    # Thin-shell charge
+    @test fR_background(m, 1.0, c) ≈ 1e-5
+    @test fR_background(m, 0.5, c) < 1e-5
+    rho = Huntian.ModifiedGravity.RHO_CRIT * c.Om
+    R_of(M) = cbrt(3M / (4π * rho))
+    Ms = screening_mass(m, 1.0, c)
+    @test scalar_charge(m, 0.5Ms, R_of(0.5Ms), 1.0, c) == 1.0
+    @test scalar_charge(m, Ms, R_of(Ms), 1.0, c) ≈ 1.0 rtol=1e-10
+    @test scalar_charge(m, 8Ms, R_of(8Ms), 1.0, c) ≈ 8^(-2/3) rtol=1e-10      # Φ_N ∝ M^(2/3)
+    @test screening_mass(HuSawicki(fR0=1e-6), 1.0, c) ≈ Ms * 10^-1.5 rtol=1e-10
+    @test scalar_charge(NDGP(H0rc=1.0), 1e16, R_of(1e16), 1.0, c) == 1.0
+    @test isinf(screening_mass(NDGP(H0rc=1.0), 1.0, c))
+    @test scalar_charge(Yukawa(eps=0.3, lambda=5.0, phi_s=1e-6), 1e15, R_of(1e15), 1.0, c) < 1
+
+    # Screened corrections use the screened ratios; GR stays zero
+    n, L = 32, 64.0
+    delta = randn(MersenneTwister(3), n, n, n)
+    xq = reshape([0.0, 2.0, -4.0], 3, 1)
+    d0, v0 = mg_patch_corrections(delta, L, xq, [5.0], 1.0, tg; screened=true)
+    @test all(iszero, d0) && all(iszero, v0)
+    tn = mg_growth_table(NDGP(H0rc=1.0), c; nk=9, na=11)
+    d1, v1 = mg_patch_corrections(delta, L, xq, [5.0], 1.0, tn)
+    ds, vs = mg_patch_corrections(delta, L, xq, [5.0], 1.0, tn; screened=true)
+    @test vec(ds) ≈ (growth_ratio(tn, 0.1, 1.0; screened=true) - 1) / (growth_ratio(tn, 0.1, 1.0) - 1) .* vec(d1) rtol=1e-8
+    @test vec(vs) ≈ (velocity_ratio(tn, 0.1, 1.0; screened=true) - 1) / (velocity_ratio(tn, 0.1, 1.0) - 1) .* vec(v1) rtol=1e-8
+end

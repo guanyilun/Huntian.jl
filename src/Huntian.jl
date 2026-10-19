@@ -31,7 +31,8 @@ using .Cosmology: CosmologyParams, E2, H, chi, chi_cmb, growth_factor, growth_ra
     ChiToZTable, build_chi_to_z, chi_to_z, peak_redshift
 using .ModifiedGravity: GravityModel, GR, HuSawicki, NDGP, Yukawa, mu, compton_k,
     MGGrowthTable, mg_growth_table, growth_ratio, velocity_ratio, mg_patch_corrections,
-    second_order_growth_ratio
+    second_order_growth_ratio, fR_background, screening_potential, halo_potential, scalar_charge,
+    screening_mass
 using .PowerSpectrum: load_pk, load_pk_nongaussian
 using .LCG: LCG
 using .NonGaussian: apply_fnl_correlated!, apply_fnl_uncorrelated!
@@ -455,7 +456,8 @@ export
     ChiToZTable, build_chi_to_z, chi_to_z, peak_redshift,
     GravityModel, GR, HuSawicki, NDGP, Yukawa, mu, compton_k,
     MGGrowthTable, mg_growth_table, growth_ratio, velocity_ratio, mg_patch_corrections,
-    second_order_growth_ratio,
+    second_order_growth_ratio, fR_background, screening_potential, halo_potential, scalar_charge,
+    screening_mass,
     load_pk, load_pk_nongaussian,
     apply_fnl_correlated!, apply_fnl_uncorrelated!,
     generate_grf,

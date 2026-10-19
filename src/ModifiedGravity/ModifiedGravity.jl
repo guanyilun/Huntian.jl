@@ -10,7 +10,8 @@ import ..Cosmology: CosmologyParams
 
 export GravityModel, GR, HuSawicki, NDGP, Yukawa, mu, compton_k,
     MGGrowthTable, mg_growth_table, growth_ratio, velocity_ratio, mg_patch_corrections,
-    second_order_growth_ratio
+    second_order_growth_ratio, fR_background, screening_potential, halo_potential, scalar_charge,
+    screening_mass
 
 const C_KMS_H = 2997.92458   # c/H0 in Mpc/h
 
@@ -40,14 +41,16 @@ Base.@kwdef struct NDGP <: GravityModel
 end
 
 """
-    Yukawa(; eps, lambda)
+    Yukawa(; eps, lambda, phi_s=Inf)
 
 Phenomenological fifth force of comoving range `lambda` [Mpc/h]: μ = 1 + ε(a) k²/(k² + λ⁻²), with
-ε(a) = eps · Ω_Λ(a)/Ω_Λ so that the force switches on with the dark energy.
+ε(a) = eps · Ω_Λ(a)/Ω_Λ so that the force switches on with the dark energy. Bodies with Newtonian
+potential Φ_N > `phi_s` (in units of c²) are screened, with charge phi_s/Φ_N (see `scalar_charge`).
 """
 Base.@kwdef struct Yukawa <: GravityModel
     eps::Float64
     lambda::Float64
+    phi_s::Float64 = Inf
 end
 
 _Em2(a, c) = c.Om / a^3 + c.OL                     # E²(a), flat matter + Λ
@@ -57,6 +60,55 @@ _Omega_m(a, c) = (c.Om / a^3) / _Em2(a, c)
 function compton_k(m::HuSawicki, a, c::CosmologyParams)
     s = c.Om + 4c.OL
     return a / C_KMS_H * sqrt(s / ((m.n + 1) * m.fR0)) * ((c.Om / a^3 + 4c.OL) / s)^((m.n + 2) / 2)
+end
+
+"""Background scalaron |f_R(a)| = |f_R0| [(Ω_m + 4Ω_Λ)/(Ω_m a⁻³ + 4Ω_Λ)]^(n+1) of Hu–Sawicki f(R)."""
+fR_background(m::HuSawicki, a, c::CosmologyParams) =
+    m.fR0 * ((c.Om + 4c.OL) / (c.Om / a^3 + 4c.OL))^(m.n + 1)
+
+"""
+    screening_potential(model, a, cosmo)
+
+Newtonian potential (units of c²) above which a body is screened: (3/2)|f_R(a)| for f(R) (thin-shell
+condition with the background field), `phi_s` for `Yukawa`, and Inf for models whose screening does not
+depend on the body (nDGP's Vainshtein mechanism) or that have no fifth force (GR).
+"""
+screening_potential(::GravityModel, a, c::CosmologyParams) = Inf
+screening_potential(m::HuSawicki, a, c::CosmologyParams) = 1.5 * fR_background(m, a, c)
+screening_potential(m::Yukawa, a, c::CosmologyParams) = m.phi_s
+
+const G_NEWTON = 4.30091e-9          # Mpc (km/s)² / M☉
+const C_KMS = 299792.458
+const RHO_CRIT = 2.775e11            # h² M☉/Mpc³, i.e. (M☉/h)/(Mpc/h)³
+
+"""
+    halo_potential(M, RTHL; Delta=200)
+
+Newtonian potential GM/(Rc²) at the edge of a halo of mass `M` [M☉/h] and Lagrangian radius `RTHL` [Mpc/h],
+taking R = RTHL/Delta^(1/3), the radius enclosing `Delta` times the mean density. h cancels.
+"""
+halo_potential(M, RTHL; Delta=200) = G_NEWTON * M / (RTHL / cbrt(Delta)) / C_KMS^2
+
+"""
+    scalar_charge(model, M, RTHL, a, cosmo; Delta=200) -> Q ∈ [0, 1]
+
+Fraction of the fifth force a halo feels: Q = min(1, Φ_s/Φ_N), the thin-shell factor with Φ_s from
+`screening_potential` and Φ_N from `halo_potential`. Using the background field makes Q an upper bound:
+a dense environment lowers |f_R| around the halo and screens it further.
+"""
+function scalar_charge(model::GravityModel, M, RTHL, a, c::CosmologyParams; Delta=200)
+    ps = screening_potential(model, a, c)
+    isinf(ps) && return 1.0
+    return min(1.0, ps / halo_potential(M, RTHL; Delta=Delta))
+end
+
+"""    screening_mass(model, a, cosmo; Delta=200) -> M [M☉/h] at which Φ_N = Φ_s (Q = 1 below it)."""
+function screening_mass(model::GravityModel, a, c::CosmologyParams; Delta=200)
+    ps = screening_potential(model, a, c)
+    isinf(ps) && return Inf
+    rho = RHO_CRIT * c.Om
+    # Φ_N = G M / (R c²), M = (4π/3) Delta ρ R³  ⇒  Φ_N = (G/c²) M^(2/3) ((4π/3) Delta ρ)^(1/3)
+    return (ps * C_KMS^2 / G_NEWTON / cbrt(4π / 3 * Delta * rho))^1.5
 end
 
 """    mu(model, k, a, cosmo)
@@ -104,10 +156,43 @@ function _solve_growth(mufn, as::AbstractVector, c::CosmologyParams; ainit=1e-3,
     return D, dD
 end
 
+# A test body in the MG density field, feeling μ_b: D_b'' + (2 + dlnH/dlna) D_b' = (3/2)Ω_m μ_b D. With μ_b = μ
+# it follows the field (D_b = D); with μ_b = 1 it is screened. Returns D, D', D_b, D_b' at `as`.
+function _solve_growth_body(mufn, mubody, as::AbstractVector, c::CosmologyParams; ainit=1e-3, nstep_per_efold=200)
+    om = _Omega_m(ainit, c)
+    p = (-1 + sqrt(1 + 24 * mufn(ainit) * om)) / 4
+    y = (ainit, p * ainit, ainit, p * ainit)
+    rhs(lna, y) = begin
+        a = exp(lna); oma = _Omega_m(a, c)
+        (y[2], -(2 - 1.5oma) * y[2] + 1.5oma * mufn(a) * y[1],
+         y[4], -(2 - 1.5oma) * y[4] + 1.5oma * mubody(a) * y[1])
+    end
+    out = [similar(as, Float64) for _ in 1:4]
+    lna = log(ainit)
+    for (i, at) in enumerate(as)
+        lnt = log(at)
+        nstep = max(1, ceil(Int, (lnt - lna) * nstep_per_efold))
+        h = (lnt - lna) / nstep
+        for _ in 1:nstep
+            k1 = rhs(lna, y)
+            k2 = rhs(lna + h / 2, y .+ (h / 2) .* k1)
+            k3 = rhs(lna + h / 2, y .+ (h / 2) .* k2)
+            k4 = rhs(lna + h, y .+ h .* k3)
+            y = y .+ (h / 6) .* (k1 .+ 2 .* k2 .+ 2 .* k3 .+ k4)
+            lna += h
+        end
+        for j in 1:4
+            out[j][i] = y[j]
+        end
+    end
+    return out[1], out[2], out[3], out[4]
+end
+
 """
     MGGrowthTable
 
-R_D(k,a) = D_MG/D_GR (displacements) and R_v(k,a) = (fD)_MG/(fD)_GR (velocities) on a grid in (ln k, a).
+R_D(k,a) = D_MG/D_GR (displacements) and R_v(k,a) = (fD)_MG/(fD)_GR (velocities) on a grid in (ln k, a), and
+the same ratios R_D⁰, R_v⁰ for a screened body: one that feels only Newtonian gravity from the MG density field.
 """
 struct MGGrowthTable{M<:GravityModel}
     model::M
@@ -115,6 +200,8 @@ struct MGGrowthTable{M<:GravityModel}
     a::Vector{Float64}
     RD::Matrix{Float64}   # (nk, na)
     Rv::Matrix{Float64}
+    RD0::Matrix{Float64}
+    Rv0::Matrix{Float64}
 end
 
 """
@@ -128,14 +215,16 @@ function mg_growth_table(model::GravityModel, c::CosmologyParams;
     lnk = collect(range(log(kmin), log(kmax); length=nk))
     as = collect(range(amin, 1.0; length=na))
     Dg, dDg = _solve_growth(a -> 1.0, as, c)
-    RD = Matrix{Float64}(undef, nk, na); Rv = similar(RD)
+    RD = Matrix{Float64}(undef, nk, na); Rv = similar(RD); RD0 = similar(RD); Rv0 = similar(RD)
     Threads.@threads for i in 1:nk
         k = exp(lnk[i])
-        D, dD = _solve_growth(a -> mu(model, k, a, c), as, c)
+        D, dD, Db, dDb = _solve_growth_body(a -> mu(model, k, a, c), a -> 1.0, as, c)
         @views RD[i, :] .= D ./ Dg
         @views Rv[i, :] .= dD ./ dDg
+        @views RD0[i, :] .= Db ./ Dg
+        @views Rv0[i, :] .= dDb ./ dDg
     end
-    return MGGrowthTable(model, lnk, as, RD, Rv)
+    return MGGrowthTable(model, lnk, as, RD, Rv, RD0, Rv0)
 end
 
 function _bilinear(t::MGGrowthTable, M::Matrix{Float64}, k, a)
@@ -148,11 +237,11 @@ function _bilinear(t::MGGrowthTable, M::Matrix{Float64}, k, a)
     return (1 - u) * (1 - v) * M[i, j] + u * (1 - v) * M[i+1, j] + (1 - u) * v * M[i, j+1] + u * v * M[i+1, j+1]
 end
 
-"""    growth_ratio(table, k, a) = D_MG(k,a)/D_GR(a); clamped to the table edges."""
-growth_ratio(t::MGGrowthTable, k, a) = _bilinear(t, t.RD, k, a)
+"""    growth_ratio(table, k, a; screened=false) = D_MG(k,a)/D_GR(a); clamped to the table edges."""
+growth_ratio(t::MGGrowthTable, k, a; screened::Bool=false) = _bilinear(t, screened ? t.RD0 : t.RD, k, a)
 
-"""    velocity_ratio(table, k, a) = (fD)_MG(k,a)/(fD)_GR(a); clamped to the table edges."""
-velocity_ratio(t::MGGrowthTable, k, a) = _bilinear(t, t.Rv, k, a)
+"""    velocity_ratio(table, k, a; screened=false) = (fD)_MG(k,a)/(fD)_GR(a); clamped to the table edges."""
+velocity_ratio(t::MGGrowthTable, k, a; screened::Bool=false) = _bilinear(t, screened ? t.Rv0 : t.Rv, k, a)
 
 _tophat(x) = x < 1e-3 ? 1.0 - x^2 / 10 : 3 * (sin(x) - x * cos(x)) / x^3
 
@@ -287,7 +376,8 @@ function _patch_mean(S_k, w, sgn, n, L, u, RTHL, Rs)
 end
 
 """
-    mg_patch_corrections(delta, boxsize, xq, RTHL, a, table; nR=12, D1=1.0, D2=nothing) -> (ddisp, dvel)
+    mg_patch_corrections(delta, boxsize, xq, RTHL, a, table; nR=12, D1=1.0, D2=nothing, screened=false)
+        -> (ddisp, dvel)
 
 MG corrections to halo displacements, to pass to `finalize_eulerian(...; ddisp, dvel)`. Halo finding stays on
 the GR linear field; each halo's mean displacement over its Lagrangian patch (a top-hat of radius `RTHL`
@@ -302,13 +392,17 @@ second-order mode itself is neglected; `second_order_growth_ratio` measures it. 
 and second-order growth at `a` in Huntian's conventions (D and −(3/7)Ω_m(a)^(−1/143) D²); with `D2 = nothing`
 the 2LPT terms are left at GR.
 
+With `screened = true` the halos are screened test bodies: R_D⁰, R_v⁰ replace R_D, R_v throughout, so they move
+under Newtonian gravity from the MG density field. A halo of charge Q (`scalar_charge`) takes
+(1 − Q)·screened + Q·unscreened.
+
 `delta` is the linear GR density (z = 0 normalisation) on a periodic n³ grid of side `boxsize` [Mpc/h] in
 Huntian's centred frame (cell I at x = Δ(I − (n+1)/2)); `xq` is 3×N Lagrangian peak positions [Mpc/h].
 Top-hat radii are tabulated at `nR` log-spaced values spanning `RTHL` and interpolated in ln R.
 """
 function mg_patch_corrections(delta::AbstractArray{<:Real,3}, boxsize::Real, xq::AbstractMatrix,
                               RTHL::AbstractVector, a::Real, t::MGGrowthTable; nR::Int=12,
-                              D1::Real=1.0, D2::Union{Nothing,Real}=nothing)
+                              D1::Real=1.0, D2::Union{Nothing,Real}=nothing, screened::Bool=false)
     n = size(delta, 1)
     @assert size(delta) == (n, n, n) "delta must be cubic"
     @assert size(xq) == (3, length(RTHL))
@@ -318,7 +412,8 @@ function mg_patch_corrections(delta::AbstractArray{<:Real,3}, boxsize::Real, xq:
     u = (xq ./ (boxsize / n)) .+ (n - 1) / 2       # 0-based fractional index
     Rmin, Rmax = extrema(RTHL)
     Rs = Rmax > Rmin ? exp.(range(log(Rmin), log(Rmax); length=nR)) : [Rmin]
-    RD(k) = _bilinear(t, t.RD, k, a); Rv(k) = _bilinear(t, t.Rv, k, a)
+    MD, Mv = screened ? (t.RD0, t.Rv0) : (t.RD, t.Rv)
+    RD(k) = _bilinear(t, MD, k, a); Rv(k) = _bilinear(t, Mv, k, a)
 
     delta_k = FFTW.rfft(Float64.(delta))
     ddisp = D1 .* _patch_mean(delta_k, k -> RD(k) - 1, 1, n, boxsize, u, RTHL, Rs)
