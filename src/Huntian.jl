@@ -2,6 +2,7 @@ module Huntian
 
 # Submodules (order matters: later files import earlier ones)
 include("Cosmology/Cosmology.jl")
+include("ModifiedGravity/ModifiedGravity.jl")
 include("InitialConditions/PowerSpectrum.jl")
 include("InitialConditions/LCG.jl")
 include("InitialConditions/RandomField.jl")
@@ -28,6 +29,9 @@ include("MultiResolution.jl")
 using .Cosmology: CosmologyParams, E2, H, chi, chi_cmb, growth_factor, growth_rate, delta_c,
     DlinearTables, Dlinear_tables, Dlinear_ab, Dfnofa,
     ChiToZTable, build_chi_to_z, chi_to_z, peak_redshift
+using .ModifiedGravity: GravityModel, GR, HuSawicki, NDGP, Yukawa, mu, compton_k,
+    MGGrowthTable, mg_growth_table, growth_ratio, velocity_ratio, mg_patch_corrections,
+    second_order_growth_ratio
 using .PowerSpectrum: load_pk, load_pk_nongaussian
 using .LCG: LCG
 using .NonGaussian: apply_fnl_correlated!, apply_fnl_uncorrelated!
@@ -449,6 +453,9 @@ export
     CosmologyParams, E2, H, chi, chi_cmb, growth_factor, growth_rate, delta_c,
     DlinearTables, Dlinear_tables, Dlinear_ab, Dfnofa,
     ChiToZTable, build_chi_to_z, chi_to_z, peak_redshift,
+    GravityModel, GR, HuSawicki, NDGP, Yukawa, mu, compton_k,
+    MGGrowthTable, mg_growth_table, growth_ratio, velocity_ratio, mg_patch_corrections,
+    second_order_growth_ratio,
     load_pk, load_pk_nongaussian,
     apply_fnl_correlated!, apply_fnl_uncorrelated!,
     generate_grf,

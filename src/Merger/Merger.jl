@@ -119,10 +119,17 @@ Websky-style catalog: **Eulerian positions + km/s peculiar velocities**. Port of
 (`Dlinear_ab[2]`). Run AFTER `merge_catalog` (which does the Lagrangian-space exclusion).
 `obs` is the observer position (Mpc/h); for ievol==1 the redshift comes from the Eulerian
 distance to `obs`, for ievol==0 from `z_out`. The 2LPT fields (vx2/vy2/vz2) are consumed → set 0.
+
+Modified gravity: `ddisp` and `dvel` (3×N, Mpc/h, already at each halo's growth) are added to disp1 in
+the position and in the velocity respectively; see `mg_patch_corrections`.
 """
 function finalize_eulerian(halos::Vector{T}, cosmo::CosmologyParams, obs::NTuple{3,<:Real};
-                           ievol::Integer=1, z_out::Real=0.0) where {T<:Union{HaloRecord,ExtHaloRecord}}
+                           ievol::Integer=1, z_out::Real=0.0,
+                           ddisp::Union{Nothing,AbstractMatrix}=nothing,
+                           dvel::Union{Nothing,AbstractMatrix}=nothing) where {T<:Union{HaloRecord,ExtHaloRecord}}
     isempty(halos) && return halos
+    ddisp === nothing || @assert size(ddisp) == (3, length(halos))
+    dvel === nothing || @assert size(dvel) == (3, length(halos))
     gt = Dlinear_tables(cosmo)
     Om, OL = cosmo.Om, cosmo.OL
     ox, oy, oz = Float64(obs[1]), Float64(obs[2]), Float64(obs[3])
@@ -133,6 +140,13 @@ function finalize_eulerian(halos::Vector{T}, cosmo::CosmologyParams, obs::NTuple
         h = halos[i]
         d1x=Float64(h.vx); d1y=Float64(h.vy); d1z=Float64(h.vz)       # 1LPT displacement (Mpc/h)
         d2x=Float64(h.vx2); d2y=Float64(h.vy2); d2z=Float64(h.vz2)    # 2LPT displacement (Mpc/h)
+        v1x, v1y, v1z = d1x, d1y, d1z
+        if dvel !== nothing
+            v1x += dvel[1, i]; v1y += dvel[2, i]; v1z += dvel[3, i]
+        end
+        if ddisp !== nothing
+            d1x += ddisp[1, i]; d1y += ddisp[2, i]; d1z += ddisp[3, i]
+        end
         ex=Float64(h.x)+d1x+d2x; ey=Float64(h.y)+d1y+d2y; ez=Float64(h.z)+d1z+d2z   # Eulerian
         a = if ievol == 1
             r = sqrt((ex-ox)^2+(ey-oy)^2+(ez-oz)^2)
@@ -141,7 +155,7 @@ function finalize_eulerian(halos::Vector{T}, cosmo::CosmologyParams, obs::NTuple
             a_snap
         end
         E = sqrt(Om*a^-3 + OL); _, f, _ = Dlinear_ab(a, gt); vfac = a*100.0*E*f   # km/s per Mpc/h
-        vx=vfac*(d1x+2*d2x); vy=vfac*(d1y+2*d2y); vz=vfac*(d1z+2*d2z)
+        vx=vfac*(v1x+2*d2x); vy=vfac*(v1y+2*d2y); vz=vfac*(v1z+2*d2z)
         out[i] = _replace_pos_vel(h, ex, ey, ez, vx, vy, vz)
     end
     return out

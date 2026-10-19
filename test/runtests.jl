@@ -3,6 +3,7 @@ using Test
 
 @testset "Huntian.jl" begin
     include("test_cosmology.jl")
+    include("test_modifiedgravity.jl")
     include("test_powerspectrum.jl")
     include("test_filters.jl")
     include("test_randomfield.jl")
