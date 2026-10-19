@@ -117,17 +117,14 @@ end
     t = mg_growth_table(NDGP(H0rc=1.0), c; nk=9, na=11)
     rd, rv = growth_ratio(t, 0.1, 1.0), velocity_ratio(t, 0.1, 1.0)
     xq = reshape([dx * (I - (n + 1) / 2) for I in (15, 30, 22)], 3, 1); R = [7.0]
+    # nDGP is scale independent, so the 2LPT corrections are exactly (R_D² − 1) D₂ and 2(R_D R_v − 1) D₂ times
+    # the patch mean of the GR ψ₂ (the top-hat approximation of the patch is tested at first order above;
+    # at second order a white-noise field puts too much power near the grid scale for a cell-sum check).
     delta_bl = irfft(bl, n)
     d1, v1 = mg_patch_corrections(delta_bl, L, xq, R, 1.0, t)
     d2, v2 = mg_patch_corrections(delta_bl, L, xq, R, 1.0, t; D2=-0.4)
-    psi2 = psi2_ref
-    I = round.(Int, xq[:, 1] ./ dx .+ (n + 1) / 2); r = ceil(Int, R[1] / dx); m = zeros(3); cnt = 0
-    for i in -r:r, j in -r:r, k in -r:r
-        (i^2 + j^2 + k^2) * dx^2 <= R[1]^2 || continue
-        ii, jj, kk = mod1.(I .+ (i, j, k), n); cnt += 1
-        m .+= (psi2[1][ii, jj, kk], psi2[2][ii, jj, kk], psi2[3][ii, jj, kk])
-    end
-    m ./= cnt
-    @test vec(d2 .- d1) ≈ -0.4 * (rd^2 - 1) .* m rtol=0.05
-    @test vec(v2 .- v1) ≈ 2 * -0.4 * (rd * rv - 1) .* m rtol=0.05
+    u = xq ./ dx .+ (n - 1) / 2
+    P = MG._patch_mean(MG._src2_pair_k(rfft(delta_bl), n, L, one_, one_), one_, -1, n, L, u, R, R)
+    @test vec(d2 .- d1) ≈ -0.4 * (rd^2 - 1) .* vec(P) rtol=1e-8
+    @test vec(v2 .- v1) ≈ 2 * -0.4 * (rd * rv - 1) .* vec(P) rtol=1e-8
 end
